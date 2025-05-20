@@ -79,7 +79,7 @@ def download_AMO_cdg(filtered=False,agg_code='annual',save_path=config.proj_base
     while (check) and (pd.to_datetime(update_date) > pd.Timestamp('2015-01')):
         if filtered:
             response = requests.get(f'https://climatedataguide.ucar.edu/sites/default/files/{update_date}/amo_monthly.10yrLP.txt')
-            filt_ext = '_10yrLP'
+            filt_ext = '_10yrLP-filter'
         else:
             response = requests.get(f'https://climatedataguide.ucar.edu/sites/default/files/{update_date}/amo_monthly.txt')
             filt_ext = ''
@@ -102,7 +102,7 @@ def download_AMO_cdg(filtered=False,agg_code='annual',save_path=config.proj_base
         print('no option for anything other than monthly or annual aggregation implemented yet')
         return
     
-    AMO.to_csv(save_path/f'AMO_HadISST1_Trenberth_{start_AMO}-{end_AMO}_{agg_code}{filt_ext}.csv',index=False)
+    AMO.to_csv(save_path/f'AMO_{agg_code}{filt_ext}_HadISST1_Trenberth_{start_AMO}-{end_AMO}.csv',index=False)
 
     if ret:
         return AMO

@@ -1,0 +1,13 @@
+name: climate_scenarios_2051
+channels:
+  - conda-forge
+dependencies:
+  - xesmf
+  - xeofs=3.0.3
+  - emd
+  - proplot
+  - cartopy
+  - ipykernel
+
+  # need extra pip install of xarray-datatree for xeofs to work correctly: pip install xarray-datatree
+  # at the end, install this package in editable mode: like pip install -e .
