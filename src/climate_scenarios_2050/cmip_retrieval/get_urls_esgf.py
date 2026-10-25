@@ -17,7 +17,7 @@ from collections import defaultdict
 
 # Input --------------------------------------------------------------
 write2file     = True
-project        = 'CMIP6' 
+project        = 'CMIP6'
 experiment_id  = 'ssp370'  #'ssp245' 'ssp370' 'historical'
 frequency      = 'mon' 
 variable       = 'psl' 
@@ -29,6 +29,8 @@ path_out  = {
     'historical': config.proj_base/'data/CMIP6/historical/url_repo/',
     'ssp245':  config.proj_base/'data/CMIP6/ssp245/url_repo/',
     'ssp370':  config.proj_base/'data/CMIP6/ssp370/url_repo/',
+    'ssp585':  config.proj_base/'data/CMIP6/ssp585/url_repo/',
+    'ssp126':  config.proj_base/'data/CMIP6/ssp126/url_repo/',
 }
 
 def get_data_urls_grouped_by_source(project, experiment_id, frequency, variable, node):

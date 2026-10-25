@@ -65,6 +65,8 @@ def esgf_search(server="https://esgf-node.llnl.gov/esg-search/search",
                     all_files.append(sp[0].split(".html")[0])
     return sorted(all_files)
 
+file_pattern = re.compile(r'^(?P<var>[a-zA-Z]+)_(?P<tres>[a-zA-Z]+)_(?P<model>[a-zA-Z0-9-]+)_(?P<scenario>[a-zA-Z0-9]+)_(?P<ensmem>r\d+i\d+p\d+f\d+)_(?P<grid>[a-zA-Z]+)_(?P<start>\d{6})-(?P<end>\d{6})\.nc$')
+
 def get_simulation(experiment,variable,model,member,activity=None):
     
     if activity is None:
@@ -76,7 +78,7 @@ def get_simulation(experiment,variable,model,member,activity=None):
             activity = ''
     
     fail = True; tries = 0
-    while fail and (tries < 15):
+    while fail and (tries < 6):
         tries += 1
         try:
             result = esgf_search(
@@ -112,6 +114,14 @@ def get_simulation(experiment,variable,model,member,activity=None):
     dl_success = {fi:'failed' for fi in file_name}
     for node in node_name:
         for fi in file_name:
+            # skipt if the output file already exists:
+            if (path_out/fi).exists():
+                continue
+            # skip if the fail contains simulations past 2100:
+            match = file_pattern.match(fi)
+            if match:
+                if int(match.group("start")[:4]) > 2099:
+                    continue
             if dl_success[fi] == 'failed':
                 dl_file = str(node/fi).replace('http:/','http://').replace('https:/','https://')
                 wget = sbp.run(
@@ -185,7 +195,7 @@ dt_fmt = '%Y%m'
 cmip_path = Path('/datalake/NS9873K/DATA/CMIP6/')
 
 # find all netcdf files:
-all_nc = sorted(list(cmip_path.rglob('*.nc')))
+all_nc = sorted(list(cmip_path.rglob('ssp*/*/*/*.nc'))) + sorted(list(cmip_path.rglob('historical/*/*/*.nc')))
 
 # sort them into groups (unique model and member_id):
 model_member_id = defaultdict(list)
@@ -203,13 +213,15 @@ for nc in all_nc:
 for mod_mem, files in model_member_id.items():
     # if multiple files exist, merge them:
     if len(files) > 1:
+        X = len(files)
+        # print(f'merging {X} files for {mod_mem}')
+        print(files)
         start_date = min([datetime.strptime(re.search('_(\d{6})-(\d{6})$',fi.stem).group(1),dt_fmt) for fi in files]).strftime(dt_fmt)
         end_date = max([datetime.strptime(re.search('_(\d{6})-(\d{6})$',fi.stem).group(2),dt_fmt) for fi in files]).strftime(dt_fmt)
         replc = re.search('(\d{6}-\d{6})$',files[0].stem).group(1)
         outfile = files[0].parent/files[0].name.replace(replc,f'{start_date}-{end_date}')
         # make sure output is saved in the variable directory:
         outfile = ensure_variable_in_path(outfile)
-        X = len(files)
         print(f'merging {X} files for {mod_mem} into {outfile}')
         mrg = sbp.run([
             'ncrcat',
@@ -232,11 +244,14 @@ status_df = pd.read_csv(proj_base/'data/CMIP6_download_for_Climate_Futures.csv')
 # new status file with updates recorded:
 new_status = status_df.copy()
 
-variable = 'pr'
+variable = 'psl'
 exclude_members = [('GISS-E2-1-G','r3i1p3f1'),]
 # go line by line through the status file to complete the updates:
+# the logic is to see if ssp370 is there. If not, download it. If it's there, try to find the corresponding historical and ssp runs
 try:
-    for _,line in status_df.iterrows():
+    for ii,line in status_df.iterrows():
+        if ii < 275:
+            continue
         model = line.model
         member = line.member_id
         # if model == 'GISS-E2-1-G':
@@ -261,6 +276,23 @@ try:
                 # if multiple files were downloaded, merge them
                 new_status,stat_ssp245 = update_status(dl_success,model,member,path_out,'ssp245',new_status)
             
+            if line[f'{variable}_ssp126'] not in ['done','copied','copeid']:
+                print("dl ssp126")
+                dl_success, path_out = get_simulation(experiment='ssp126',variable=variable,model=model,member=member)
+                # if multiple files were downloaded, merge them
+                new_status,stat_ssp245 = update_status(dl_success,model,member,path_out,'ssp126',new_status)
+            if line[f'{variable}_ssp585'] not in ['done','copied','copeid']:
+                print("dl ssp585")
+                dl_success, path_out = get_simulation(experiment='ssp585',variable=variable,model=model,member=member)
+                # if multiple files were downloaded, merge them
+                new_status,stat_ssp245 = update_status(dl_success,model,member,path_out,'ssp585',new_status)
+            if line[f'{variable}_ssp119'] not in ['done','copied','copeid']:
+                print("dl ssp119")
+                dl_success, path_out = get_simulation(experiment='ssp119',variable=variable,model=model,member=member)
+                # if multiple files were downloaded, merge them
+                new_status,stat_ssp245 = update_status(dl_success,model,member,path_out,'ssp119',new_status)
+            
+
 except Exception as exc:
     print(exc)
     pass
@@ -268,10 +300,10 @@ except Exception as exc:
 new_status.to_csv(proj_base/'data/CMIP6_download_for_Climate_Futures.csv',index=False)
 
 
-#--------find all available ssp370 simulations---------#
+#--------find all available sspXXX simulations---------#
 
-# find all available ssp370 simulations:
-pathway = 'ssp245'
+# find all available sspXXX simulations:
+pathway = 'ssp585'
 result = esgf_search(
         files_type='HTTPServer',
         table_id='Amon',

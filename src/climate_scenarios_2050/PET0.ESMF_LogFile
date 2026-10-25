@@ -1,0 +1,7 @@
+20251014 192235.069 ERROR            PET0 ESMCI_VM.C:2256 ESMCI::VM::getCurrent() Internal error: Bad condition  - - Could not determine current VM
+20260225 130116.487 ERROR            PET0 ESMCI_VM.C:2318 ESMCI::VM::getCurrent() Internal error: Bad condition  - - Could not determine current VM
+20260225 132129.176 ERROR            PET0 ESMCI_VM.C:2318 ESMCI::VM::getCurrent() Internal error: Bad condition  - - Could not determine current VM
+20260225 132913.644 ERROR            PET0 ESMCI_VM.C:2318 ESMCI::VM::getCurrent() Internal error: Bad condition  - - Could not determine current VM
+20260225 132957.806 ERROR            PET0 ESMCI_VM.C:2318 ESMCI::VM::getCurrent() Internal error: Bad condition  - - Could not determine current VM
+20260325 105332.594 ERROR            PET0 ESMCI_VM.C:2318 ESMCI::VM::getCurrent() Internal error: Bad condition  - - Could not determine current VM
+20260515 104958.378 ERROR            PET0 ESMCI_VM.C:2318 ESMCI::VM::getCurrent() Internal error: Bad condition  - - Could not determine current VM

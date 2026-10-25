@@ -1,7 +1,11 @@
-from climate_scenarios_2050.config import proj_base,data_paths, var_name_map, NAO_box, example_grid_file
+from climate_scenarios_2050.config import proj_base,data_paths, var_name_map, NAO_box, example_grid_file, model_id_file
+from climate_scenarios_2050.subsampling_list import Smith_subsampling
+
+import pickle
 
 import pandas as pd
 import re
+import os
 
 import xarray as xr
 import numpy as np
@@ -53,6 +57,24 @@ def preprocess_expand_member_dim(ds):
     ds = ds.sel(mode=1).copy()
     if 'member' not in ds.dims:
         ds = ds.expand_dims('member')
+    # Add model name as coordinate (from filename)
+    return ds
+
+def preprocess_expand_member_dim_(ds):
+    ds = ds.copy()
+    # round coordinate values to avoid duplicate coords
+    if "lat" in ds.dims:
+        ds['lat'] = ds['lat'].round(3)
+        ds['lon'] = ds['lon'].round(3)
+    elif "latitude" in ds.dims:
+        ds['latitude'] = ds['latitude'].round(3)
+        ds['longitude'] = ds['longitude'].round(3)
+
+    # Ensure 'member' dimension exists
+    if 'member' not in ds.dims:
+        ds = ds.expand_dims('member').assign_coords(member=[ds.attrs["variant_label"]])
+    if "time" in ds.dims:
+        ds = ds.sortby("time").drop_duplicates(dim="time", keep="first")
     # Add model name as coordinate (from filename)
     return ds
 
@@ -459,3 +481,121 @@ def ext_from_months(month_list):
         seas_ext = '_ann'
 
     return seas_ext
+
+def subsample(ensemble,subsampling,NAO_ref="HadSLP"):
+
+    ensemble = ensemble.copy()
+
+    base_path_search = proj_base/'data/CMIP6_processed'
+    
+    av_models_id = np.unique(ensemble.m_id)
+
+    with open(model_id_file,'rb') as f:
+        model_id = pickle.load(f)
+    av_models = [mod for mod,id in model_id.items() if id in av_models_id]
+
+    if 'varsplit' in subsampling:
+        obs_split = xr.open_dataarray(proj_base/f'data/{NAO_ref}/{subsampling}_{NAO_ref}_psl_EOF_full_index_DJFM_1850-2014_1.5deg.nc').sel(mode=1)
+        # subselect the models based on the amount of low-frequency NAO variance:
+        model_selection = []
+        for model in av_models:
+            mtch_fl = sorted(list((base_path_search/f"historical/{model}/EOF_model/").glob(f"{subsampling}_{model}_psl_EOF_{NAO_ref}_index_DJFM_*_1.5deg.nc")))
+            if mtch_fl:
+                if len(mtch_fl) > 1:
+                    print("WARNING: found multiple matches for subsampling file, using {:}".format(mtch_fl[0]))
+                vsplit = xr.open_dataarray(mtch_fl[0]).sel(mode=1)
+            else:
+                print("No matching subsampling file found for {:}!".format(model))
+            # if the ratio in the observations is more than 10% larger than in the simulations, drop the model
+            # print('{:} obs: {:1.2f} sim: {:1.2f}'.format(model,obs_split.values, vsplit.values))
+            criterion = abs(obs_split - vsplit) < .1
+            if criterion:
+                model_selection.append(model)
+    elif 'NAO_AR' in subsampling:
+        # load the simulation list:
+        model_sel_file = proj_base/'data/subsampling'/f'{subsampling}_subsampling.pkl'
+        with open(model_sel_file, "rb") as fp:
+            model_selection = pickle.load(fp)
+    elif "Smith" in subsampling:
+        model_selection = [amo for amo in av_models if amo in Smith_subsampling[subsampling]]
+    else:
+        print('{:} subsampling not implemented yet'.format(subsampling))
+        return
+
+    model_id_selection = [model_id[model] for model in model_selection]
+
+    return ensemble.sel(member=ensemble.m_id.isin(model_id_selection).values)
+
+
+
+def load_model_ensemble_NAO(subsampling,scen,ref_ds):
+    """
+    load a full (1850 - 2100) time series of yearly NAO index, using members from the 
+    scenario `scen`. NAO is the projection of the SLP from the models onto the interannual EOF1
+    of reference dataset `ref_ds`
+    `subsampling` should be a list of CMIP6 models to use out of the available ones
+    """
+
+    base_path_search = proj_base/'data/CMIP6_processed'
+
+    # load unique model identifier for naming ensemble members:
+    with open(model_id_file,'rb') as f:
+        model_id = pickle.load(f)
+
+    # get a list of all available models:
+    models = []
+    for exp in ['historical',scen]:
+        # Collect files (SLP projected onto reference NAO pattern)
+        file_list = sorted(list(base_path_search.glob(f"{exp}/*/EOF_model/*psl_EOF_{ref_ds}*index*1850-20*.nc")))
+        # Remove empty ones:
+        file_list = [filename for filename in file_list if os.path.getsize(filename) > 0]
+        # get model name:
+        models.append(sorted(list(set([filename.parent.parent.stem for filename in file_list]))))
+    # only select those member for which both historical and scenario simulations exist:
+    av_models = sorted(list(set(models[0]).intersection(models[1])))
+
+    if subsampling is None:
+        model_selection = av_models
+    elif 'varsplit' in subsampling:
+        obs_split = xr.open_dataarray(proj_base/f'data/{ref_ds}/{subsampling}_{ref_ds}_psl_EOF_full_index_DJFM_1850-2014_1.5deg.nc').sel(mode=1)
+        # subselect the models based on the amount of low-frequency NAO variance:
+        model_selection = []
+        for model in av_models:
+            vsplit = xr.open_dataarray(base_path_search/f'historical/{model}/EOF_model/{subsampling}_{model}_psl_EOF_{ref_ds}_index_DJFM_1850-2014_1.5deg.nc').sel(mode=1)
+            # if the ratio in the observations is more than 10% larger than in the simulations, drop the model
+            # print('{:} obs: {:1.2f} sim: {:1.2f}'.format(model,obs_split.values, vsplit.values))
+            criterion = (obs_split - vsplit) < .1
+            if criterion:
+                model_selection.append(model)
+    elif 'NAO_AR' in subsampling:
+        # load the simulation list:
+        model_sel_file = proj_base/'data/subsampling'/f'{subsampling}_subsampling.pkl'
+        with open(model_sel_file, "rb") as fp:
+            model_selection = pickle.load(fp)
+    elif "Smith" in subsampling:
+        model_selection = [amo for amo in av_models if amo in Smith_subsampling[subsampling]]
+    else:
+        print('{:} subsampling not implemented yet'.format(subsampling))
+        return
+
+    index_series = []
+    for ii,model in enumerate(model_selection):
+        print(model)
+        filename_hist = list(base_path_search.glob(f"historical/{model}/EOF_model/{model}*psl_EOF_{ref_ds}*index*DJFM_1850-2014*.nc"))[0]
+        try:
+            filename_scen = list(base_path_search.glob(f"{scen}/{model}/EOF_model/{model}*psl_EOF_{ref_ds}*index*DJFM_1850-20*.nc"))[0]
+        except:
+            print(f"skipping {model}")
+            continue
+        ds_hist = preprocess_expand_member_dim(xr.open_dataset(filename_hist))
+        ds_scen = preprocess_expand_member_dim(xr.open_dataset(filename_scen))
+
+        common_members = np.intersect1d(ds_hist['member'], ds_scen['member'])
+
+        ds = xr.concat([ds_hist.sel(member=common_members), ds_scen.sel(member=common_members)], dim='year')
+        
+        ext_mems = [model_id[model]+mem for mem in ds.member.values]
+
+        index_series.append(ds.assign_coords(member=ext_mems))
+            
+    return xr.concat(index_series,dim='member')

@@ -102,8 +102,11 @@ def invert(x):
     x[~near_zero] = 1 / x[~near_zero]
     return x
 
-def plot_loadings_and_spectrum(index,pattern,period,model_name,freqs,psd,K,roll=8,extra_title='',nmode=1,units='1',variable_name='SLP',domain=None,print_dec_var=None,ylims=None,xlims=None):
+def plot_loadings_and_spectrum(index,pattern,period,model_name,freqs,psd,K,norm_period=None,roll=8,extra_title='',nmode=1,units='1',variable_name='SLP',domain=None,print_dec_var=None,ylims=None,xlims=None):
     # index_filt = index.rolling(year=roll).mean().dropna('year')
+
+    if norm_period is None:
+        norm_period = period
 
     try:
         lag1_autocorr = np.corrcoef(index.values[:,1:].flatten(),index.values[:,:-1].flatten())[0,1]
@@ -118,7 +121,7 @@ def plot_loadings_and_spectrum(index,pattern,period,model_name,freqs,psd,K,roll=
     ax0 = fig.subplot(gs[0:2,0:2], proj='npstere',proj_kw={'central_longitude':-20, }) # 'lcc','central_latitude':45,
     pc0 = ax0.contourf(pattern.lon,pattern.lat,pattern,levels=np.arange(-1,1.01,.2))
     ax0.format(
-        title='{3} EOF{2} pattern ({0} - {1})'.format(period[0],period[-1],nmode,variable_name), coast=True, latlines=30, lonlines=60,
+        title='{3} EOF{2} pattern ({0} - {1})'.format(norm_period[0],norm_period[-1],nmode,variable_name), coast=True, latlines=30, lonlines=60,
     )
     ax0.colorbar(pc0, loc='r', label=f'{units}', extendsize='1.7em')
     if domain is not None:
@@ -174,7 +177,7 @@ def plot_loadings_and_spectrum(index,pattern,period,model_name,freqs,psd,K,roll=
     freq_ticks = np.array([.01,.02,.05,.1,.2])  # Common log-scale ticks
 
     ax2.format(
-        title='Multitaper Spectrum',
+        title='Multitaper Spectrum ({0} - {1})'.format(*period),
         ylabel='Spectral Density', xlabel='Frequency (year$^{-1}$)',
         yscale='log',xscale='log',
         xticks=freq_ticks

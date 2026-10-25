@@ -154,29 +154,43 @@ units = {
     "msl":"hPa",
 }
 
+database_path = Path("/datalake/NS9873K/DATA/CMIP6")
+
+interpolate_method = {
+    "pr":"conservative",
+    "psl":"bilinear",
+    "rsds":"bilinear",
+    "sfcWind":"bilinear",
+    "tas":"bilinear",
+    "tos":"bilinear",
+}
+
+CMIP6_base = Path("/datalake/NS9873K/DATA/CMIP6")
+
 data_paths = {
     'verification':{
         'ERA5':base_path/'DATA/SFE/ERA5/res_monthly_1',
         # others?
     },
-    'hindcast':{
-        'NorCPM1':Path('/datalake/NS9873K/DATA/DCPP/dcppA-hindcast/NorCPM1/'),
-        'EC-Earth3':Path('/datalake/NS9873K/DATA/DCPP/dcppA-hindcast/EC-Earth3/'),
-        'HadGEM3-GC31-MM':Path('/datalake/NS9873K/DATA/DCPP/dcppA-hindcast/HadGEM3-GC31-MM/'),
-        'CMCC-CM2-SR5':Path('/datalake/NS9873K/DATA/DCPP/dcppA-hindcast/CMCC-CM2-SR5/'),
-        'MPI-ESM1-2-HR':Path('/datalake/NS9873K/DATA/DCPP/dcppA-hindcast/MPI-ESM1-2-HR/'),
-        'CanESM5':Path('/datalake/NS9873K/DATA/DCPP/dcppA-hindcast/CanESM5/'),
-        'MPI-ESM1-2-LR':Path('/datalake/NS9873K/DATA/DCPP/dcppA-hindcast/MPI-ESM1-2-LR/'),
-        'CNRM-ESM2-1':Path('/datalake/NS9873K/DATA/DCPP/dcppA-hindcast/CNRM-ESM2-1/'),
-        'MIROC6':Path('/datalake/NS9873K/DATA/DCPP/dcppA-hindcast/MIROC6/'),
-    },
-    'forecast':{
-        'NorCPM1':Path('/projects/NS9034K/CMIP6/.cmorout/NorCPM1/dcppB-forecast'),
-        # others?
-    },
-    'processed':base_path/'owul/data/statkraft_pilot4/decadal_predictions',
-    'figures':base_path/'owul/figures/decadal_predictions',
-    'figures_online':base_path/'www/decadal'
+    'processed':Path(proj_base/"data/CMIP6_processed"),
+    # 'hindcast':{
+    #     'NorCPM1':Path('/datalake/NS9873K/DATA/DCPP/dcppA-hindcast/NorCPM1/'),
+    #     'EC-Earth3':Path('/datalake/NS9873K/DATA/DCPP/dcppA-hindcast/EC-Earth3/'),
+    #     'HadGEM3-GC31-MM':Path('/datalake/NS9873K/DATA/DCPP/dcppA-hindcast/HadGEM3-GC31-MM/'),
+    #     'CMCC-CM2-SR5':Path('/datalake/NS9873K/DATA/DCPP/dcppA-hindcast/CMCC-CM2-SR5/'),
+    #     'MPI-ESM1-2-HR':Path('/datalake/NS9873K/DATA/DCPP/dcppA-hindcast/MPI-ESM1-2-HR/'),
+    #     'CanESM5':Path('/datalake/NS9873K/DATA/DCPP/dcppA-hindcast/CanESM5/'),
+    #     'MPI-ESM1-2-LR':Path('/datalake/NS9873K/DATA/DCPP/dcppA-hindcast/MPI-ESM1-2-LR/'),
+    #     'CNRM-ESM2-1':Path('/datalake/NS9873K/DATA/DCPP/dcppA-hindcast/CNRM-ESM2-1/'),
+    #     'MIROC6':Path('/datalake/NS9873K/DATA/DCPP/dcppA-hindcast/MIROC6/'),
+    # },
+    # 'forecast':{
+    #     'NorCPM1':Path('/projects/NS9034K/CMIP6/.cmorout/NorCPM1/dcppB-forecast'),
+    #     # others?
+    # },
+    # 'processed':base_path/'owul/data/statkraft_pilot4/decadal_predictions',
+    # 'figures':base_path/'owul/figures/decadal_predictions',
+    # 'figures_online':base_path/'www/decadal'
 }
 model_id_file = proj_base/'src/climate_scenarios_2050/model_id.pkl'
 
@@ -189,19 +203,20 @@ def model_mapping(base_dir,model_id_file):
     else:
         model_id = {}
 
+    # TODO: fix this, it doesn't work for updating model list/encoding!!
     # find the existing models:
     models = {model.name:f'm{ii}' for (ii,model) in enumerate(sorted(list((base_dir/'data/CMIP6/historical').glob('*')))) if not model.name in ['OLD','url_repo']}
     # Add only new subdirectories
     next_id = max(model_id.values(), default=-1) + 1
-    for subdir in models.values:
+    for subdir in models.values():
         if subdir not in model_id:
             model_id[subdir] = next_id
             next_id += 1
 
-    
     # save mapping:
     with open(model_id_file,'wb') as f:
         pickle.dump(model_id,f)
+
 if __name__ == '__main__':
     
     model_id_file = proj_base/'src/climate_scenarios_2050/model_id.pkl'

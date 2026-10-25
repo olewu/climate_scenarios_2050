@@ -19,7 +19,7 @@ from pathlib import Path
 # Input --------------------------------------------------------------
 write2file     = True
 project        = 'CMIP6'
-experiment_id  = 'ssp370'
+experiment_id  = 'ssp585'
 frequency      = 'mon'
 variable       = 'psl'
 time_range     = np.array((185001,201412)) 

@@ -1,0 +1,6 @@
+--2026-06-11 15:04:50--  https://wind-api.dashboards.sigma2.no/timeseries?latitude=%7Bsite_latitude%7D
+Resolving wind-api.dashboards.sigma2.no (wind-api.dashboards.sigma2.no)... 158.36.102.245
+Connecting to wind-api.dashboards.sigma2.no (wind-api.dashboards.sigma2.no)|158.36.102.245|:443... connected.
+HTTP request sent, awaiting response... 422 Unprocessable Entity
+2026-06-11 15:04:50 ERROR 422: Unprocessable Entity.
+
