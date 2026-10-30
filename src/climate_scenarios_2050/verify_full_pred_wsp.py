@@ -41,6 +41,8 @@ elif variable == "energy":
 
 # full verification field, remove forced component for verification:
 vf_ds_ann = vf_ds.groupby(vf_ds.time.dt.year).mean()
+# label calendar year Y+1 with Y to match the DJFM NAO convention (year of December), as in `linear_model_wsp_NAO.py`:
+vf_ds_ann = vf_ds_ann.assign_coords(year=vf_ds_ann.year - 1)
 
 NAO_MMEM = xr.open_dataarray(f"/datalake/NS9873K/DATA/CMIP6/wind_db/NAO_MMEM_{scenario}.nc")
 NAO_MMEM_centered_full = NAO_MMEM - NAO_MMEM.sel(year=vf_ds_ann.year).mean(dim="year")
@@ -58,7 +60,7 @@ vf_ds_annual_internal_full = (vf_ds_annual_centered_full - vf_ds_forced_full).ro
 
 # LOAD STATISTICAL MODEL PARAMETERS (FITTED TO 9-YEAR MEANS OF INTERNAL VARIABILITY):
 # load linear model parameters (derived in `linear_model_wsp_NAO.py`):
-model_params = xr.open_dataset(database/f"wsp100_NAO_linear_model_params_internal_var_{scenario}.nc")
+model_params = xr.open_dataset(database/f"wsp100_NAO_linear_model_params_internal_var_{scenario}_by-valid-year.nc")
 # model_params_local = model_params.sel(pt_sel)
 
 # LOAD NAO HINDCASTS:
@@ -76,8 +78,7 @@ ds_hc_proc_bylt = by_year_struct_to_by_leadtime(ds_hc_proc)
 
 # APPLY STATISTICAL MODEL TO HINDCASTS:
 lead_times_select = ds_hc_proc_bylt.lead_time.values[4::5] # selected lead times, take any subset of (0, 35)
-# prediction of 9-year average internal variability component in the predictand (wsp or wp):
-var_pred = model_params["slope"].rename(year="init_year") * ds_hc_proc_bylt.mean("member").sel(lead_time=lead_times_select) + model_params["intercept"].rename(year="init_year")
+ds_hc_em_bylt = ds_hc_proc_bylt.mean("member")
 # # full variability (internal + forced) prediction
 forced_rm = vf_ds_forced_full.rolling(year=Nyr,center=True).mean("year")
 clim = vf_ds_ann.mean(dim="year")
@@ -94,8 +95,10 @@ for lt in lead_times_select:
     vf_range = [] # leave empty to verify all available time steps!
     
     # INTERNAL VARIABILITY COMPONENTS:
-    pred_int = var_pred.sel(lead_time=lt)
-    pred_int = pred_int.swap_dims({"init_year":"year"})
+    # prediction of Nyr-average internal variability component in the predictand (wsp or wp):
+    # model parameters are indexed by valid year (fitted excluding the target window)
+    hc_lt = ds_hc_em_bylt.sel(lead_time=lt).swap_dims({"init_year":"year"})
+    pred_int = model_params["slope"] * hc_lt + model_params["intercept"]
     if vf_range:
         pred_int = pred_int.sel(year=slice(*vf_range))
     vf_int, pred_int = xr.align(vf_ds_annual_internal_full, pred_int, join="inner")

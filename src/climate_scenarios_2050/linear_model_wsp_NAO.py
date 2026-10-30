@@ -2,10 +2,12 @@
 Make a linear prediction model of the form wsp100/wep = alpha*NAO + beta + eps that makes a 
 prediction of wind speed or wind energy production from the state of the NAO
 Make a cross-validated version of the model so that it can be applied in hindcast mode,
-i.e. for a prediction of wsp100 for the year 2000, the mode is only fitted excluding "present" 
-and "near-future" data (but including some distant future data to not exclude too much
-for fitting).
-Save model parameters w/ dimensions (lat/lon/(init)time) for both wsp100 and wep
+i.e. for a prediction of the Nyr-mean wsp100 centered on (valid) year 2000, the model is fitted
+excluding all samples whose Nyr-window overlaps with the target window (but including the
+remaining past and future data to not exclude too much for fitting).
+Since the exclusion only depends on the valid year (init_year + lead_time), the parameters are
+indexed by valid year.
+Save model parameters w/ dimensions (lat/lon/valid year) for both wsp100 and wep
 """
 
 import xarray as xr
@@ -13,6 +15,7 @@ from pathlib import Path
 from climate_scenarios_2050.utils import make_season_group,load_model_ensemble_NAO
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
+import numpy as np
 from climate_scenarios_2050.config import *
 
 # def detrend_dim(da, dim, deg=1):
@@ -29,13 +32,13 @@ from climate_scenarios_2050.config import *
 #         trend, da_detrended = detrend_dim(da_detrended, dim, deg=deg)
 #     return trend, da_detrended
 
-predictand_name = "energy"
+predictand_name = "wsp100"
 forcing = "ssp245"
 Nyr = 8
 
 # load (hourly) predictand dataset:
 if predictand_name == "wsp100":
-    prdctnd_monthly = xr.open_dataset("/projects/NS9873K/www/scenarios_2050/wind_power_production_dataset/monthly_aggregation/wsp100_GWAscaled_1940-2024_.nc")
+    prdctnd_monthly = xr.open_dataset("/projects/NS9873K/www/scenarios_2050/wind_power_production_dataset/monthly_aggregation/wsp100_GWAscaled_1940-2024.nc")
 elif predictand_name == "energy": # note that this is just taking one specific turbine and hub height!
     prdctnd_monthly = xr.open_dataset("/projects/NS9873K/www/scenarios_2050/wind_power_production_dataset/monthly_aggregation/N175-120m_dry-dens_1940-2024.nc")
 
@@ -82,47 +85,41 @@ wsp_forced_full = beta_wsp_full * NAO_MMEM_centered_full
 wsp_annual_internal_full = wsp_annual_centered_full[predictand_name] - wsp_forced_full
 
 
-# iterate over all years to make a model for each initialization
+# iterate over all valid years to make a model for each target window
+# (the same model applies to all init_year/lead_time combinations with init_year + lead_time = valid year)
 alpha, beta, sigma = [],[],[]
 wsp_pred = []
-for init_year in wsp_annual.year.values:
-# init_year = 2000
-    # print(init_year)
-    # exclude "future" data:
-    year_excl= [init_year - Nyr//2, init_year+Nyr]
-    incl_years = [yr for yr in wsp_annual.year.values if yr not in range(*year_excl)]
-
-    wsp_annual_subs = wsp_annual.sel(year=incl_years)
-    nao_subs = nao_full.sel(year=incl_years)
+for valid_year in wsp_annual.year.values:
+    # exclude all annual values entering the target Nyr-window (conservative w.r.t. the centering of even windows):
+    excl_years = range(valid_year - Nyr//2, valid_year + Nyr//2 + 1)
+    incl_years = [yr for yr in wsp_annual.year.values if yr not in excl_years]
 
     NAO_MMEM_centered = NAO_MMEM - NAO_MMEM.sel(year=incl_years).mean(dim="year")
 
     # compute forcing and internal component here, otherwise the forced component part will be "perfect"
-    wsp_annual_centered = wsp_annual_subs - wsp_annual_subs.mean(dim="year")
-    # at this point, the beta estimation is not leaking future information (different from a trend!)
-    beta_wsp = xr.cov(wsp_annual_centered[predictand_name],NAO_MMEM_centered.sel(year=incl_years),dim="year")/NAO_MMEM_centered.sel(year=incl_years).var(dim="year")
-    wsp_forced = beta_wsp * NAO_MMEM_centered.sel(year=incl_years)
+    # centering and beta are estimated from the included years only, but applied to the full (contiguous) series
+    # so that the rolling means below do not average across the gap of excluded years
+    wsp_annual_centered = wsp_annual[predictand_name] - wsp_annual[predictand_name].sel(year=incl_years).mean(dim="year")
+    beta_wsp = xr.cov(wsp_annual_centered.sel(year=incl_years),NAO_MMEM_centered.sel(year=incl_years),dim="year")/NAO_MMEM_centered.sel(year=incl_years).var(dim="year")
+    wsp_forced = beta_wsp * NAO_MMEM_centered
     # remove the forced response from the full wind field to get internal variability:
-    wsp_annual_internal = wsp_annual_centered[predictand_name] - wsp_forced
+    wsp_annual_internal = wsp_annual_centered - wsp_forced
 
-    # compute forcing and internal component here, otherwise the forced component part will be "perfect"
-    nao_centered = nao_subs - nao_subs.mean(dim="year")
-    # at this point, the beta estimation is not leaking future information (different from a trend!)
-    beta_nao = xr.cov(nao_centered,NAO_MMEM_centered.sel(year=incl_years),dim="year")/NAO_MMEM_centered.sel(year=incl_years).var(dim="year")
-    nao_forced = beta_nao*NAO_MMEM_centered.sel(year=incl_years)
-    # remove the forced response from the full wind field to get internal variability:
+    nao_centered = nao_full - nao_full.sel(year=incl_years).mean(dim="year")
+    beta_nao = xr.cov(nao_centered.sel(year=incl_years),NAO_MMEM_centered.sel(year=incl_years),dim="year")/NAO_MMEM_centered.sel(year=incl_years).var(dim="year")
+    nao_forced = beta_nao*NAO_MMEM_centered
+    # remove the forced response from the NAO to get internal variability:
     nao_internal = nao_centered - nao_forced
 
-    # filter
+    # filter on the contiguous series
     nao_roll = nao_internal.rolling(year=Nyr,center=True).mean("year").dropna("year")
-    # final predictor
+    wsp_seasonal_int_roll = wsp_annual_internal.rolling(year=Nyr,center=True).mean("year").dropna("year",how="all")
 
-    # filter
-    wsp_seasonal_int_roll = wsp_annual_internal.rolling(year=Nyr,center=True).mean().sel(year=nao_roll.year)
-    # this is the final predictand field
-
-    prdctnd = wsp_seasonal_int_roll #.sel(year=year_subs)
-    prdctr = nao_roll #.sel(year=year_subs)
+    # keep only samples where both are defined and whose Nyr-window does not overlap with the target window:
+    prdctr, prdctnd = xr.align(nao_roll, wsp_seasonal_int_roll, join="inner")
+    train = (np.abs(prdctr.year - valid_year) >= Nyr).values
+    prdctr = prdctr.isel(year=train) # final predictor
+    prdctnd = prdctnd.isel(year=train) # final predictand field
 
     x_mean = prdctr.mean("year")
     y_mean = prdctnd.mean("year")
@@ -140,7 +137,7 @@ for init_year in wsp_annual.year.values:
     sigma.append(res_std)
 
     # make actual prediction:
-    wsp_pred.append(slope * index_int_var_obs.rolling(year=Nyr,center=True).mean("year").sel(year=init_year) + intercept)
+    wsp_pred.append(slope * index_int_var_obs.rolling(year=Nyr,center=True).mean("year").sel(year=valid_year) + intercept)
 
 alpha = xr.concat(alpha,dim=wsp_annual.year)
 beta = xr.concat(beta,dim=wsp_annual.year)
@@ -199,4 +196,4 @@ model_params = xr.Dataset(
 # it can be directly applied to a NAO hindcast (which is a prediction of the internal
 # variability componente of the NAO) to get at an estimate of the internal var component of wind
 # and then the forced wind signal needs to be added
-model_params.to_netcdf(f"/datalake/NS9873K/DATA/CMIP6/wind_db/{predictand_name}_NAO_linear_model_params_internal_var_{forcing}.nc")
+model_params.to_netcdf(f"/datalake/NS9873K/DATA/CMIP6/wind_db/{predictand_name}_NAO_linear_model_params_internal_var_{forcing}_by-valid-year.nc")
