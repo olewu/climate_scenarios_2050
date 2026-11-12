@@ -1,0 +1,3 @@
+# skip the synthetic null test (quick experiments)
+synthetic_null:
+  enabled: false

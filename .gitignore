@@ -57,3 +57,7 @@ MANIFEST
 .venv*/
 .conda*/
 .python-version
+
+# pixi environment
+.pixi/
+*.ESMF_LogFile

@@ -1,0 +1,121 @@
+# Default configuration. Override single entries with files in configs/experiments/
+# (deep-merged in the given order). Every step hashes the sections it depends on, so
+# changing a parameter here automatically leads to new output folders.
+
+resources:
+  n_jobs: 4               # parallel workers (members/models/init years); runs interactively, keep moderate
+  dask_threads: 4
+
+cmip6:
+  scenarios: [ssp119, ssp126, ssp245, ssp370, ssp585]   # all scenarios (forecasts, scenario uncertainty)
+  scenarios_hindcast: [ssp245, ssp370]                   # scenarios used for hindcast evaluation
+  period: [1850, 2100]    # calendar years read from historical + scenario runs
+  weighting: model        # model: every model counts once | member: every member counts once
+
+#---------------step 1: preprocessing--------------#
+preprocess:
+  grid_spacing: 1.5       # global regular grid, cell centres at +-0.75, ..., lon -179.25 ... 179.25
+  overwrite: false        # replace existing regridded archives
+  keep_monthly: false     # also store regridded monthly fields (large)
+  fields:
+    psl:
+      method: bilinear
+      aggregations: {DJFM: [12, 1, 2, 3]}
+      domain: {lon: [-100, 60], lat: [10, 90]}
+    sfcWind:
+      method: bilinear
+      aggregations: {annual: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], DJF: [12, 1, 2], JJA: [6, 7, 8]}
+      domain: {lon: [-35, 45], lat: [25, 75]}
+  obs_datasets: [ERA5, HadSLP, 20CR]
+
+predictor:
+  name: nao
+  method: eof             # eof | box (station-based) | jet, amv (not implemented yet)
+  variable: psl
+  aggregation: DJFM
+  domain: {lon: [-90, 40], lat: [20, 80]}
+  mode: 1
+  normal_period: [1950, 2015]          # pattern fitting, centering and standardization period
+  detrend_for_fit: true                # linearly detrend the fitting sample (as before)
+  pattern_source: ERA5                 # ERA5 | HadSLP | 20CR | own (each model its own pattern)
+  n_modes: 10
+  sign_reference_point: {lat: 35.25, lon: -20.25}   # positive pattern value here (Azores high for NAO+)
+  box: null                            # for method: box, e.g. {south: {...}, north: {...}}
+
+obs:
+  matching_index: merged               # merged | ERA5 | HadSLP | 20CR
+  merge:
+    datasets: [HadSLP, ERA5]           # [early, late]
+    year: 1980                         # first season taken from the late dataset
+    harmonization_period: [1940, 2018] # overlap used to rescale the late to the early dataset (frozen)
+  training_index: ERA5                 # index used for the linear model (consistent with the wind data)
+  wind_variable: wsp100                # wsp100 | energy
+
+#---------------step 2: forced/internal split--------------#
+split:
+  method: mmem                         # mmem | polynomial | lowpass_mmem
+  polynomial_degree: 2
+  lowpass: {cutoff_period: 5, order: 4}
+  obs_leakage: leave_target_out        # leave_target_out (C) | full_period (A)
+  min_model_fraction: 0.5              # MMEM is NaN in years with fewer models (runs ending early)
+  min_fit_years: 15                    # no coefficients with fewer years
+
+#---------------step 3: analogue hindcasts--------------#
+analogues:
+  selection: subsample                 # subsample | shift | shift_subsample
+  measure: CORR                        # CORR | RMSE | two_stage
+  two_stage_fraction: 0.5              # two_stage: the CORR stage keeps M / fraction members, RMSE then the best M
+  filter: {type: running_mean, length: 41, min_periods_frac: 0.25}   # or {type: lowpass/bandpass, cutoff_periods: [...], order: 4}
+  window: 70                           # matching window length (years up to and incl. init) or "all"
+  min_window_coverage: 1.0             # fraction of the window a member must have data for
+  first_init: null                     # null: first year with a complete matching window
+  M: 100
+  max_lag: 25                          # shift selection
+  preselection: null                   # null | varsplit_<N>y | Smith_incl_best | Smith_excl_worst | NAO_AR1_D2.5
+  model_filter_at_init: full           # full: centred filter over the whole model series (no observed future is used, the
+                                       # selection constrains the members' next years to the recent observed state)
+                                       # cut: model series cut at init and filtered like the observations (no skill)
+  max_lead: 37                         # 33 + half of the running mean of the continuous evaluation
+
+synthetic_null: {enabled: true, n: 500, seed: 42}
+
+baselines:
+  members: 100
+  seed: 2050
+  ar1:
+    ar1_fair: {fit_window: 70, fit_on: annual}
+    ar1_all: {fit_window: all, fit_on: annual}
+    ar1_rm_fair: {fit_window: 70, fit_on: running_mean, running_mean: 8}   # old: fitted on the running mean
+  sine_trend: {fit_window: 70, cutoff_period: 20}
+
+#---------------targets and verification--------------#
+target:
+  windows: [[1, 5], [6, 10], [11, 15], [16, 20], [21, 25], [26, 30], [1, 10], [11, 20], [21, 30], [1, 20], [11, 30]]
+  reference_length: 20
+  predictor_lag: 1                     # season t-1 predicts wind in year t
+  change: relative                     # relative (%) | absolute
+
+#---------------step 4: linear model--------------#
+linear_model:
+  leave_out: overlap_target            # exclude training windows overlapping the target window
+  min_samples: 20                      # no fit with fewer (overlapping) training windows
+
+#---------------step 5/6: wind methods--------------#
+forced_wind: nao_mmem                  # nao_mmem (a) | cmip6_sfcwind (b) | none (c)
+
+evaluation:
+  quantiles: [0.5, 0.9]
+  bootstrap: {n: 1000, method: moving_block, seed: 12345}
+  nao_continuous: {running_mean: 8, lead_times: [1, 33]}
+  sites:
+    UtsiraNord: {lat: 59.25, lon: 4.54}
+    CelticSea: {lat: 51.75, lon: -6.24}
+    NorfolkBoreas: {lat: 53.08, lon: 2.82}
+    NorthernSpain: {lat: 44.03, lon: -8.63}
+    Smola: {lat: 63.47, lon: 6.45}
+    NISA: {lat: 53.70, lon: -5.86}
+    SorligeNordsjo2: {lat: 56.83, lon: 5.04}
+
+#---------------step 7: yearly update of the index--------------#
+update:
+  tolerance: 0.01                      # largest accepted difference in the seasons already in the index

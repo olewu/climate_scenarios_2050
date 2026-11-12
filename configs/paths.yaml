@@ -1,0 +1,23 @@
+# Input data (read only - nothing is ever written below these paths)
+inputs:
+  # original CMIP6 monthly files: <cmip6>/<experiment>/<model>/<variable>/<variable>_Amon_<model>_<experiment>_<variant>_<grid>_<YYYYMM>-<YYYYMM>.nc
+  cmip6: /datalake/NS9873K/DATA/CMIP6
+  # ERA5 monthly means, one file per month: <era5_monthly>/<long variable name>/<long variable name>_<YYYY>_<MM>.nc
+  era5_monthly: /datalake/NS9873K/DATA/SFE/ERA5/res_monthly_1
+  hadslp: /projects/NS9873K/owul/projects/climate_scenarios_2050/data/HadSLP/slp.mnmean.real.nc
+  20cr: /projects/NS9873K/owul/projects/climate_scenarios_2050/data/20CRV3/prmsl.mon.mean.nc
+  # ERA5-based monthly wind data (GWA-scaled 100 m wind speed, wind energy of one turbine type)
+  wind:
+    wsp100: /projects/NS9873K/www/scenarios_2050/wind_power_production_dataset/monthly_aggregation/wsp100_GWAscaled_1940-2026.nc
+    energy: /projects/NS9873K/www/scenarios_2050/wind_power_production_dataset/monthly_aggregation/N175-120m_dry-dens_1940-2026.nc
+
+  # model lists of the AR-based analogue pre-selection
+  subsampling: /projects/NS9873K/owul/projects/climate_scenarios_2050/data/subsampling
+
+# Output roots (all outputs go below one of these)
+outputs:
+  # regridded/aggregated CMIP6 fields
+  cmip6_processed: /datalake/NS9873K/DATA/CMIP6/processed
+  # everything else (indices, splits, hindcasts, models, evaluation, forecasts)
+  root: /datalake/NS9873K/users/owul/climate_scenarios_v2
+  figures: /projects/NS9873K/www/users/owul/climate_scenarios_2050

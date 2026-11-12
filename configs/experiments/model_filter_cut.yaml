@@ -1,0 +1,3 @@
+# model series cut at init and filtered exactly like the observations (no skill in the NAO hindcasts, see DESIGN.md)
+analogues:
+  model_filter_at_init: cut

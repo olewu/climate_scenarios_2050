@@ -1,0 +1,52 @@
+[workspace]
+name = "climate_scenarios_2050"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+# versions pinned to the conda env (`climate_scenarios_2051`) the old scripts ran with
+[dependencies]
+python = "3.10.*"
+numpy = "1.26.*"
+scipy = "1.15.*"
+pandas = "2.2.*"
+xarray = "2023.7.*"
+xarray-datatree = "0.0.14.*"
+dask = "2025.3.*"
+zarr = "2.18.*"
+numcodecs = "0.13.*"
+netcdf4 = "1.7.*"
+h5netcdf = "1.7.*"
+cftime = "1.6.*"
+cf_xarray = "0.10.*"
+bottleneck = "1.6.*"
+esmpy = "8.9.*"
+xesmf = "0.8.8.*"
+xeofs = "3.0.3.*"
+statsmodels = "0.14.*"
+properscoring = "0.1.*"
+scikit-learn = "1.6.*"
+joblib = "1.4.*"
+pyyaml = "6.0.*"
+matplotlib-base = "3.4.*"
+proplot = "0.9.7.*"
+cartopy = "0.22.*"
+cdsapi = "*"
+pytest = "*"
+ipykernel = "*"
+setuptools = "<81"  # proplot needs pkg_resources
+setuptools-scm = "*"
+
+[pypi-dependencies]
+climate_scenarios_2050 = { path = ".", editable = true }
+
+[tasks]
+preprocess = "python -m climate_scenarios_2050.run preprocess"
+split = "python -m climate_scenarios_2050.run split"
+hindcast-nao = "python -m climate_scenarios_2050.run hindcast-nao"
+evaluate-nao = "python -m climate_scenarios_2050.run evaluate-nao"
+linear-model = "python -m climate_scenarios_2050.run linear-model"
+hindcast-wind = "python -m climate_scenarios_2050.run hindcast-wind"
+evaluate-wind = "python -m climate_scenarios_2050.run evaluate-wind"
+forecast = "python -m climate_scenarios_2050.run forecast"
+update-index = "python -m climate_scenarios_2050.run update-index"
+test = "pytest tests -q -p no:cacheprovider -o addopts=''"
