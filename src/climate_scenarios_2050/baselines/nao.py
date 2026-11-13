@@ -3,8 +3,8 @@ Statistical baselines for the NAO hindcasts, with the same layout as the analogu
 (init_year, member, lead). Negative leads hold the observations known at init.
 
 - AR(1) on the annual internal index up to init, around its linear trend (the trend is not
-  extrapolated). `fit_window` limits the fit to the last years ("fair": as long as the matching window)
-  or uses all prior data ("all"). The old `nao_ar1_lofreq_forecast.py` fitted the 8-year running mean,
+  extrapolated). `fit_window` limits the fit to the last years ("matching": the analogue matching window,
+  resolved in `load_config`) or uses all prior data ("all"). The old `nao_ar1_lofreq_forecast.py` fitted the 8-year running mean,
   available with `fit_on: running_mean`: there values are forecasts of the smoothed index.
 - sine + trend on the low-pass filtered index plus MA(1) residuals (old `nao_fft_forecast.py`), deterministic
 """
@@ -94,7 +94,9 @@ def fft_hindcast(obs_at_init, inits, leads, bcfg) -> xr.DataArray:
     cutoff = bcfg["cutoff_period"]
     previous = None
     for ii, init in enumerate(inits):
-        series = obs_at_init(int(init)).sel(year=slice(None, int(init))).isel(year=slice(-bcfg["fit_window"], None))
+        series = obs_at_init(int(init)).sel(year=slice(None, int(init)))
+        if bcfg["fit_window"] != "all":
+            series = series.isel(year=slice(-bcfg["fit_window"], None))
         years, values = series.year.values, series.values
         low = lowpass(values, cutoff)
         t = years - 1850.0

@@ -1,0 +1,8 @@
+cmip6:
+  weighting: member
+
+predictor:
+  name: ea
+  mode: 2
+  sign_reference_point: {lon: -20, lat: 55}
+

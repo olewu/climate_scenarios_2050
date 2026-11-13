@@ -40,6 +40,8 @@ setuptools-scm = "*"
 climate_scenarios_2050 = { path = ".", editable = true }
 
 [tasks]
+cmip6-inventory = "python -m climate_scenarios_2050.run cmip6-inventory"
+cmip6-download = "python -m climate_scenarios_2050.run cmip6-download"
 preprocess = "python -m climate_scenarios_2050.run preprocess"
 split = "python -m climate_scenarios_2050.run split"
 hindcast-nao = "python -m climate_scenarios_2050.run hindcast-nao"

@@ -79,21 +79,51 @@ def test_join_time_rounding_differences_do_not_duplicate_rows():
     assert joined.sizes["lat"] == 3 and joined["v"].notnull().all()
 
 
+def fake_archive(tmp_path, models, scenario="ssp370"):
+    """archive with one (non-empty) historical and scenario file per member, and a config pointing to it"""
+    from climate_scenarios_2050.preprocess import cmip6
+
+    cmip6._discover_cached.cache_clear()
+    for model, variants in models.items():
+        for variant in variants:
+            for exp, period in [("historical", "185001-201412"), (scenario, "201501-210012")]:
+                fl = tmp_path / "archive" / exp / model / "psl" / f"psl_Amon_{model}_{exp}_{variant}_gn_{period}.nc"
+                fl.parent.mkdir(parents=True, exist_ok=True)
+                fl.write_bytes(b"x")
+    return {
+        "preprocess": {"grid_spacing": 1.5, "fields": {"psl": {"method": "bilinear", "domain": {}, "aggregations": {"DJFM": [12, 1, 2, 3]}}}},
+        "cmip6": {"period": [1850, 2100]},
+        "paths": {"outputs": {"cmip6_processed": str(tmp_path / "processed")}, "inputs": {"cmip6": str(tmp_path / "archive")}},
+    }
+
+
+def test_member_list_enters_hash(tmp_path):
+    from climate_scenarios_2050.preprocess import cmip6
+
+    cfg = fake_archive(tmp_path, {"A": ["r1i1p1f1"], "B": ["r1i1p1f1"]})
+    before = cmip6.field_id(cfg, "psl", "DJFM", "ssp370")
+    keys = {m: cmip6.model_key(v) for m, v in cmip6.members(cfg, "psl", "ssp370").items()}
+    assert cmip6.field_id(cfg, "psl", "DJFM", "ssp245") != before   # other scenario, other members
+
+    fake_archive(tmp_path, {"A": ["r2i1p1f1"]})   # new member of A
+    after = cmip6.field_id(cfg, "psl", "DJFM", "ssp370")
+    keys_after = {m: cmip6.model_key(v) for m, v in cmip6.members(cfg, "psl", "ssp370").items()}
+    assert after != before
+    assert keys_after["B"] == keys["B"] and keys_after["A"] != keys["A"]   # only A is regridded again
+
+
 def test_open_field_keeps_full_model_names(tmp_path):
     from climate_scenarios_2050.preprocess import cmip6
 
-    cfg = {
-        "preprocess": {"grid_spacing": 1.5, "fields": {"psl": {"method": "bilinear", "domain": {}, "aggregations": {"DJFM": [12, 1, 2, 3]}}}},
-        "cmip6": {"period": [1850, 2100]},
-        "paths": {"outputs": {"cmip6_processed": str(tmp_path)}},
-    }
+    cfg = fake_archive(tmp_path, {"A-1": ["r1i1p1f1"], "LONGER-MODEL-NAME": ["r1i1p1f1"]})
     store, _ = cmip6.field_store(cfg, "psl", "DJFM")
+    found = cmip6.members(cfg, "psl", "ssp370")
     for model, mid, extra in [("A-1", "m0", {}), ("LONGER-MODEL-NAME", "m12", {"height": 10.0})]:
         ds = xr.Dataset(
             {"psl": (("member", "year"), np.ones((1, 2), dtype="float32"))},
             coords={"member": [f"{mid}r1"], "year": [2000, 2001], "model": ("member", [model]), "model_id": ("member", [mid]), **extra},
         )
-        ds.to_zarr(store / "ssp370" / f"{model}.zarr")
+        ds.to_zarr(cmip6.model_store(store, "ssp370", model, found[model]))
     field = cmip6.open_field(cfg, "psl", "DJFM", "ssp370")
     assert sorted(field["model_id"].values) == ["m0", "m12"]
     assert "LONGER-MODEL-NAME" in field["model"].values and "height" not in field.coords

@@ -18,6 +18,12 @@ The components of the linear-model methods are stored as well: `internal`, `forc
 (the latter where sfcWind exists). `forced_wind` selects which forced part enters M0, M2b and M3b.
 
 If a window lies inside the record, the observed change is added (`observed`).
+
+Member values are stored per scenario in `members_init<year>[_ref<year>]_<scenario>.nc` (distributions
+of the site figure): the predictor window mean of every member (`x_all`, with weights) and of the
+analogue members (`x_analogue`), slope and residual spread of the linear model in the units of the
+change (`slope_u`, `sigma_u`), and the sfcWind change of every member on the CMIP6 grid. M2b/M3b are
+then the mixture of N(mean + slope_u (x_m - weighted mean of x), sigma_u) over the members.
 """
 
 import logging
@@ -136,7 +142,7 @@ def forecast_scenario(cfg, scenario, wind_variable, init, windows, reference_end
             log.info(f"no sfcWind for {scenario}")
     mmem = split.sfcwind_mmem() if field is not None else None
 
-    outputs = []
+    outputs, member_parts = [], []
     for window, label in zip(windows, labels):
         a, b = window
         length = b - a + 1
@@ -148,8 +154,13 @@ def forecast_scenario(cfg, scenario, wind_variable, init, windows, reference_end
         def predictor(members, member_lags=None):
             values = matching.align_leads(members.values, members.year.values, init, leads, member_lags)
             return np.where(np.isfinite(values).all(axis=1), values.mean(axis=1), np.nan)
-        all_mean, all_std = weighted_mean_std(predictor(internal), weights)
-        ana_mean, ana_std = weighted_mean_std(predictor(at_selected, lags), np.full(len(selected), 1 / len(selected)))
+        x_all, x_ana = predictor(internal), predictor(at_selected, lags)
+        all_mean, all_std = weighted_mean_std(x_all, weights)
+        ana_mean, ana_std = weighted_mean_std(x_ana, np.full(len(selected), 1 / len(selected)))
+        members = xr.Dataset({
+            "x_all": ("member", x_all), "x_analogue": ("analogue", x_ana),
+            "slope_u": (slope * to_units).astype("float32"), "sigma_u": (sigma * to_units).astype("float32"),
+        })
 
         forced_nao = (fc.forced_part(design.sel(year=slice(init + a, init + b)), wind_coef).mean("year") - forced_ref) * to_units
         forced_cmip = None
@@ -177,6 +188,8 @@ def forecast_scenario(cfg, scenario, wind_variable, init, windows, reference_end
             mean, std = weighted_mean_std(changes, member_weights(field["model_id"].values, cfg["cmip6"]["weighting"]))
             changes_a = sfcwind_change(field.values[rows], field.year.values, init, window, ref_len, np.asarray(lags)[found], reference_end)
             mean_a, std_a = weighted_mean_std(changes_a, np.full(len(rows), 1 / max(len(rows), 1)))
+            members["sfc_change"] = (("sfc_member", "lat", "lon"), changes)
+            members["sfc_change_analogue"] = (("sfc_analogue", "lat", "lon"), changes_a)
             for name, m, s in [("M2a", mean, std), ("M3a", mean_a, std_a)]:
                 grid = {"lat": field.lat, "lon": field.lon}
                 on_wind = lambda v: to_wind_grid(xr.DataArray(v, dims=("lat", "lon"), coords=grid), wind_ref) * from_percent
@@ -196,25 +209,98 @@ def forecast_scenario(cfg, scenario, wind_variable, init, windows, reference_end
             ds["observed"] = (wind.sel(year=slice(init + a, init + b)).mean("year") - wind_ref) * to_units
         ds["n_training_windows"] = n
         outputs.append(ds.expand_dims(window=[label]))
+        member_parts.append(members.drop_vars("mode", errors="ignore").expand_dims(window=[label]))
 
     result = xr.concat(outputs, dim="window").expand_dims(scenario=[scenario])
     result["reference_wind"] = wind_ref
     result.attrs.update({"init_year": init, "units": "%" if tcfg["change"] == "relative" else "units of wind", "reference_period": f"{reference_end - ref_len + 1}-{reference_end}", "n_analogues": len(selected)})
-    return result
+
+    members = xr.concat(member_parts, dim="window")
+    members = members.assign_coords(member=internal.member.values.astype(str), analogue=np.asarray(selected).astype(str))
+    members["weight_all"] = ("member", weights)
+    members["analogue_lag"] = ("analogue", np.asarray(lags))
+    if field is not None:
+        members = members.assign_coords(sfc_member=field.member.values.astype(str), sfc_analogue=np.asarray(selected)[found].astype(str), lat=field.lat.values, lon=field.lon.values)
+        members["sfc_weight"] = ("sfc_member", member_weights(field["model_id"].values, cfg["cmip6"]["weighting"]))
+        members.attrs["sfc_units"] = "%"
+    members.attrs.update({"init_year": init, "scenario": scenario, "change": tcfg["change"]})
+    return result, members
 
 
-def site_table(ds: xr.Dataset, lat: float, lon: float) -> pd.DataFrame:
+#---------------distributions at a site--------------#
+def _kde_bandwidth(values, weights):
+    """Scott's rule with the effective number of members"""
+    w = weights / weights.sum()
+    mean = (w * values).sum()
+    std = np.sqrt((w * (values - mean) ** 2).sum())
+    n_eff = 1 / (w**2).sum()
+    return max(1.06 * std * n_eff ** (-1 / 5), 1e-6)
+
+
+def site_components(point: xr.Dataset, members, name: str, reference_wind: float):
+    """
+    predictive distribution of one method at one site as a Gaussian mixture (mu, sigma, weight);
+    `point`: the forecast at the site for one scenario and window, `members`: the member values
+    (same scenario and window) or None
+    """
+    mean, spread = float(point["mean"].sel(fc_method=name)), float(point["spread"].sel(fc_method=name))
+    single = (np.array([mean]), np.array([spread]), np.array([1.0]))
+    if members is None or not np.isfinite(mean):
+        return single
+    site = {"latitude": float(point.latitude), "longitude": float(point.longitude)}
+    if name in ("M2b", "M3b"):
+        x = members["x_all" if name == "M2b" else "x_analogue"].values
+        w = members["weight_all"].values if name == "M2b" else np.ones(len(x))
+        ok = np.isfinite(x)
+        x, w = x[ok], w[ok] / w[ok].sum()
+        slope = float(members["slope_u"].sel(site, method="nearest"))
+        sigma = float(members["sigma_u"].sel(site, method="nearest"))
+        return mean + slope * (x - (w * x).sum()), np.full(len(x), sigma), w
+    if name in ("M2a", "M3a") and "sfc_change" in members:
+        var = "sfc_change" if name == "M2a" else "sfc_change_analogue"
+        values = members[var].interp(lat=site["latitude"], lon=site["longitude"]).values
+        w = members["sfc_weight"].values if name == "M2a" else np.ones(len(values))
+        ok = np.isfinite(values)
+        values, w = values[ok], w[ok] / w[ok].sum()
+        if members.attrs.get("change") == "absolute":
+            values = values * reference_wind / 100
+        # variance-preserving kernel density: members shrunk towards the mean so that the
+        # mixture has the members' weighted variance (= the tabulated spread)
+        h = _kde_bandwidth(values, w)
+        center = (w * values).sum()
+        var = (w * (values - center) ** 2).sum()
+        shrink = np.sqrt(max(1 - h**2 / var, 0.0)) if var > 0 else 1.0
+        return center + shrink * (values - center), np.full(len(values), h), w
+    return single
+
+
+def mixture_quantiles(mu, sigma, w, quantiles=(0.05, 0.5, 0.95)):
+    from scipy.special import ndtr
+
+    grid = np.linspace((mu - 5 * sigma).min(), (mu + 5 * sigma).max(), 4001)
+    cdf = (w[:, None] * ndtr((grid[None, :] - mu[:, None]) / sigma[:, None])).sum(axis=0)
+    return [float(np.interp(q, cdf, grid)) for q in quantiles]
+
+
+def site_table(ds: xr.Dataset, lat: float, lon: float, members=None):
+    """table of the forecasts at a site and the mixture components of each (scenario, window, method)"""
     point = ds.sel(latitude=lat, longitude=lon, method="nearest")
-    rows = []
+    rows, components = [], {}
     for scenario in point.scenario.values:
+        mem = None if members is None else members.get(str(scenario))
         for window in point.window.values:
             sub = point.sel(scenario=scenario, window=window)
+            reference_wind = float(sub["reference_wind"]) if "reference_wind" in sub else np.nan
             for name in sub.fc_method.values:
                 row = {"scenario": scenario, "window": window, "fc_method": name, "mean": float(sub["mean"].sel(fc_method=name)), "spread": float(sub["spread"].sel(fc_method=name))}
+                if np.isfinite(row["mean"]):
+                    comp = site_components(sub, None if mem is None else mem.sel(window=window), str(name), reference_wind)
+                    components[(str(scenario), str(window), str(name))] = comp
+                    row.update(dict(zip(["q05", "q50", "q95"], mixture_quantiles(*comp))))
                 if "observed" in sub:
                     row["observed"] = float(sub["observed"])
                 rows.append(row)
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), components
 
 
 def run(cfg, init: int, scenarios=None, wind_variable=None, windows=None, site=None, reference_wind=None, reference_end=None):
@@ -225,12 +311,20 @@ def run(cfg, init: int, scenarios=None, wind_variable=None, windows=None, site=N
     log.info(f"forecast init {init} -> {out.dir}")
     tag = "" if reference_end is None else f"_ref{reference_end}"
     fl = out.path(f"forecast_init{init}{tag}.nc")
+    member_files = {s: out.path(f"members_init{init}{tag}_{s}.nc") for s in available}
+    missing_members = [s for s in available if not member_files[s].exists()]
+    # an existing forecast is read, never rewritten; member files of older forecasts are added
+    computed = {}
+    for scenario in (available if not fl.exists() else missing_members):
+        computed[scenario] = forecast_scenario(cfg, scenario, wind_variable, init, windows, reference_end)
+        if not member_files[scenario].exists():
+            write_netcdf(computed[scenario][1], member_files[scenario], cfg, compress=True)
     if fl.exists():
         log.info(f"{fl} exists, reading it")
         with xr.open_dataset(fl) as stored:
             ds = stored.load()
     else:
-        parts = [forecast_scenario(cfg, s, wind_variable, init, windows, reference_end) for s in available]
+        parts = [computed[s][0] for s in available]
         reference = parts[0]["reference_wind"]
         attrs = parts[0].attrs
         # scenarios without sfcWind lack M2a/M3a and the CMIP6 forced part: NaN there
@@ -245,15 +339,16 @@ def run(cfg, init: int, scenarios=None, wind_variable=None, windows=None, site=N
         write_netcdf(ds, fl, cfg, compress=True)
     if site is None:
         return out, ds, None
-    table = site_table(ds, *site)
+    members = {s: xr.open_dataset(member_files[s]) for s in available}
+    table, components = site_table(ds, *site, members=members)
     if reference_wind is not None:
         if ds.attrs["units"] != "%":
             raise ValueError("a measured reference wind needs relative changes (target.change: relative)")
-        for col in [c for c in ["mean", "spread", "observed"] if c in table]:
+        for col in [c for c in ["mean", "spread", "q05", "q50", "q95", "observed"] if c in table]:
             table[f"{col}_abs"] = table[col] * reference_wind / 100
     name = f"site_{site[0]:.2f}N_{site[1]:.2f}E_init{init}{tag}"
     table.to_csv(out.path(f"{name}.csv"), index=False)
     log.info(f"wrote {out.path(name + '.csv')}")
     from climate_scenarios_2050.plotting.forecast import plot_site
-    plot_site(cfg, out, table, name, ds.attrs)
+    plot_site(cfg, out, table, components, name, ds.attrs)
     return out, ds, table

@@ -23,7 +23,7 @@ import xarray as xr
 
 from climate_scenarios_2050.core.io import StepOutput, write_netcdf
 from climate_scenarios_2050.preprocess import cmip6, obs
-from climate_scenarios_2050.preprocess.indices.compute import index_output, open_cmip6_index, open_obs_index
+from climate_scenarios_2050.preprocess.indices.compute import cmip6_index_output, index_output, open_cmip6_index, open_obs_index
 from climate_scenarios_2050.split import forced as fc
 
 log = logging.getLogger(__name__)
@@ -33,7 +33,8 @@ def split_output(cfg, scenario: str) -> StepOutput:
     return StepOutput(
         cfg, "split", sections=["split", "target"],
         extra={"scenario": scenario, "weighting": cfg["cmip6"]["weighting"]},
-        upstream={"indices": index_output(cfg).hash},
+        upstream={"indices": index_output(cfg).hash, "cmip6_indices": cmip6_index_output(cfg, scenario).hash,
+                  "sfcWind": cmip6.field_id(cfg, "sfcWind", "annual", scenario)},
     )
 
 
@@ -105,6 +106,17 @@ def sfcwind_mmem(cfg, scenario: str):
     return mmem.compute().rename("sfcWind_mmem")
 
 
+def ensure_wind_coefficients(cfg, scenario: str, out, basis, wind_variable: str):
+    """forced-fit coefficients of the observed wind; computed if the wind input is new (a few minutes)"""
+    fl = out.path(wind_file(cfg, wind_variable))
+    if not fl.exists():
+        log.info(f"split {scenario}: wind coefficients for the current {wind_variable} input -> {fl.name}")
+        with_windows = scenario in cfg["cmip6"]["scenarios_hindcast"]
+        coefs = wind_coefficients(obs.open_obs_wind(cfg, wind_variable), basis, cfg, with_windows)
+        write_netcdf(coefs, fl, cfg, compress=True)
+    return fl
+
+
 def run_scenario(cfg, scenario: str):
     out = split_output(cfg, scenario).prepare()
     log.info(f"split {scenario} -> {out.dir}")
@@ -121,11 +133,8 @@ def run_scenario(cfg, scenario: str):
         if not out.exists(f"obs_{name}.nc"):
             write_netcdf(index_coefficients(open_obs_index(cfg, name), basis, cfg), out.path(f"obs_{name}.nc"), cfg)
 
-    with_windows = scenario in cfg["cmip6"]["scenarios_hindcast"]
     for wind_variable in available_wind_variables(cfg):
-        if not out.exists(wind_file(cfg, wind_variable)):
-            coefs = wind_coefficients(obs.open_obs_wind(cfg, wind_variable), basis, cfg, with_windows)
-            write_netcdf(coefs, out.path(wind_file(cfg, wind_variable)), cfg, compress=True)
+        ensure_wind_coefficients(cfg, scenario, out, basis, wind_variable)
 
     if not out.exists("sfcWind_mmem.nc"):
         mmem_wind = sfcwind_mmem(cfg, scenario)
@@ -173,7 +182,8 @@ class SplitResults:
         return series - fc.forced_part(fc.design_matrix(self.basis, series.year.values), coef)
 
     def wind_coef(self, wind_variable: str, case: str) -> xr.DataArray:
-        return xr.open_dataset(self.out.path(wind_file(self.cfg, wind_variable)))[case]
+        fl = ensure_wind_coefficients(self.cfg, self.scenario, self.out, self.basis, wind_variable)
+        return xr.open_dataset(fl)[case]
 
     def wind_design(self, years) -> xr.DataArray:
         return fc.design_matrix(self.basis, years, lag=self.cfg["target"]["predictor_lag"])

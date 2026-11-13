@@ -36,7 +36,8 @@ log = logging.getLogger(__name__)
 
 
 def evaluation_output(cfg, scenario) -> StepOutput:
-    return StepOutput(cfg, "evaluate_nao", sections=["evaluation", "baselines"], upstream={"hindcast_nao": hindcast_output(cfg, scenario).hash})
+    # the significance test and the sites of the wind evaluation are not used here
+    return StepOutput(cfg, "evaluate_nao", sections=["evaluation", "baselines"], upstream={"hindcast_nao": hindcast_output(cfg, scenario).hash}, exclude={"evaluation": ["significance", "sites"]})
 
 
 def lead_window_change(hc: xr.DataArray, windows, reference_length: int) -> xr.DataArray:
@@ -125,6 +126,23 @@ def obs_running_verification(internal_full, inits, leads, Nyr) -> xr.DataArray:
     return xr.DataArray(align_leads(smooth[None, :].repeat(len(inits), axis=0), internal_full.year.values, 0, leads, inits), dims=("init_year", "lead"), coords={"init_year": inits, "lead": leads})
 
 
+def hindcast_overview(cfg, products, internal_full, name) -> xr.Dataset:
+    """
+    ensemble mean of the analogue hindcast (init_year, lead), smoothed like the continuous evaluation,
+    and the observed internal index with the same centred running mean (visual verification)
+    """
+    Nyr = cfg["evaluation"]["nao_continuous"]["running_mean"]
+    analogue = products["analogue"].rolling(lead=Nyr, center=True).mean().mean("member")
+    observed = running_mean(internal_full.values, Nyr, Nyr)[0]
+    ds = xr.Dataset({
+        "analogue_mean": analogue,
+        "observed": xr.DataArray(observed, dims="year", coords={"year": internal_full.year.values}),
+        "observed_raw": xr.DataArray(internal_full.values, dims="year", coords={"year": internal_full.year.values}),
+    })
+    ds.attrs.update({"running_mean": Nyr, "matching_window": str(cfg["analogues"]["window"]), "observations": name, "index": cfg["predictor"]["name"]})
+    return ds
+
+
 def window_evaluation(cfg, products, obs_change, windows) -> xr.Dataset:
     ref_len = cfg["target"]["reference_length"]
     quantiles = cfg["evaluation"]["quantiles"]
@@ -200,6 +218,8 @@ def run_scenario(cfg, scenario):
     verification = obs_running_verification(internal_full, inits, leads, ncfg["running_mean"])
     if not out.exists("continuous.nc"):
         write_netcdf(continuous_evaluation(cfg, products, verification, leads_eval), out.path("continuous.nc"), cfg)
+    if not out.exists("hindcast_overview.nc"):
+        write_netcdf(hindcast_overview(cfg, products, internal_full, name), out.path("hindcast_overview.nc"), cfg)
 
     if not out.exists("windows.nc"):
         obs_change = obs_window_change(series, design, split.obs_coef(name, "coef_window_lag0"), windows, cfg["target"]["reference_length"])

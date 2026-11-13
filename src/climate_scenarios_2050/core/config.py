@@ -47,6 +47,19 @@ def load_config(override_files=(), paths_file=None, default_file=None) -> dict:
     for override_file in override_files:
         cfg = deep_merge(cfg, load_yaml(override_file))
     cfg["paths"] = load_yaml(paths_file or CONFIG_DIR / "paths.yaml")
+    return resolve_matching_window(cfg)
+
+
+def resolve_matching_window(cfg: dict) -> dict:
+    """
+    baseline `fit_window: matching` -> the analogue matching window (`analogues.window`), so the
+    "fair" baselines always see as much of the past as the analogues. Resolved before hashing: the
+    hash records the actual window (default 70, i.e. unchanged hashes).
+    """
+    baselines = cfg.get("baselines", {})
+    for bcfg in [*baselines.get("ar1", {}).values(), baselines.get("sine_trend", {})]:
+        if bcfg.get("fit_window") == "matching":
+            bcfg["fit_window"] = cfg["analogues"]["window"]
     return cfg
 
 

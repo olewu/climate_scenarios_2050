@@ -3,7 +3,7 @@
 # changing a parameter here automatically leads to new output folders.
 
 resources:
-  n_jobs: 4               # parallel workers (members/models/init years); runs interactively, keep moderate
+  n_jobs: 8               # parallel workers (members/models/init years); runs interactively, keep moderate
   dask_threads: 4
 
 cmip6:
@@ -11,6 +11,17 @@ cmip6:
   scenarios_hindcast: [ssp245, ssp370]                   # scenarios used for hindcast evaluation
   period: [1850, 2100]    # calendar years read from historical + scenario runs
   weighting: model        # model: every model counts once | member: every member counts once
+
+#---------------step 0: CMIP6 download (not hashed; `pixi run cmip6-inventory`, `pixi run cmip6-download`)--------------#
+download:
+  table: Amon
+  variables: [psl, sfcWind, tas, pr, ua]
+  experiments: [historical, ssp119, ssp126, ssp245, ssp370, ssp585]
+  index_nodes: [ceda, dkrz, ornl]      # searched in this order; the inventory uses all of them
+  prefer_grid: gn                      # grid of new members (members already in the archive keep theirs)
+  workers: 4                           # parallel file downloads
+  subsets:                             # variables read as a subset through OPeNDAP, stored as <variable>_<tag>
+    ua: {plev: 85000, lat: [10, 80], tag: plev850_lat10-80}
 
 #---------------step 1: preprocessing--------------#
 preprocess:
@@ -82,11 +93,12 @@ synthetic_null: {enabled: true, n: 500, seed: 42}
 baselines:
   members: 100
   seed: 2050
+  # fit_window: years up to init used for the fit; "matching" = analogues.window (fair comparison), or "all"
   ar1:
-    ar1_fair: {fit_window: 70, fit_on: annual}
+    ar1_fair: {fit_window: matching, fit_on: annual}
     ar1_all: {fit_window: all, fit_on: annual}
-    ar1_rm_fair: {fit_window: 70, fit_on: running_mean, running_mean: 8}   # old: fitted on the running mean
-  sine_trend: {fit_window: 70, cutoff_period: 20}
+    ar1_rm_fair: {fit_window: matching, fit_on: running_mean, running_mean: 8}   # old: fitted on the running mean
+  sine_trend: {fit_window: matching, cutoff_period: 20}
 
 #---------------targets and verification--------------#
 target:
@@ -107,6 +119,13 @@ evaluation:
   quantiles: [0.5, 0.9]
   bootstrap: {n: 1000, method: moving_block, seed: 12345}
   nao_continuous: {running_mean: 8, lead_times: [1, 33]}
+  significance:                        # wind skill maps: skill beyond M0 against phase-randomized surrogates
+    enabled: true
+    n: 1000                            # surrogates
+    seed: 2026
+    alpha: 0.05                        # global level; FDR at q = fdr_factor * alpha (Wilks 2016)
+    fdr_factor: 2
+    chunk_points: 500                  # grid points per parallel job (memory)
   sites:
     UtsiraNord: {lat: 59.25, lon: 4.54}
     CelticSea: {lat: 51.75, lon: -6.24}

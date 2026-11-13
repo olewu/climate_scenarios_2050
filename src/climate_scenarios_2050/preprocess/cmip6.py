@@ -15,6 +15,7 @@ Output: one zarr per model, `<cmip6_processed>/<variable>_<aggregation>/<hash>/<
 with dims (member, year, lat, lon); member names `<model id><variant>` (ids from configs/model_ids.yaml).
 """
 
+import functools
 import logging
 import re
 from pathlib import Path
@@ -91,6 +92,36 @@ def cut_native(ds: xr.Dataset, domain: dict, margin: float = DOMAIN_MARGIN) -> x
 
 
 #---------------file discovery--------------#
+@functools.lru_cache(maxsize=None)
+def _discover_cached(cmip6_root: str, variable: str, scenario: str) -> dict:
+    return discover_members(cmip6_root, variable, scenario)
+
+
+def members(cfg, variable: str, scenario: str) -> dict:
+    """members in the archive with historical and scenario files (scanned once per process)"""
+    return _discover_cached(str(cfg["paths"]["inputs"]["cmip6"]), variable, scenario)
+
+
+def model_key(variants: dict) -> str:
+    """hash of a model's input: its members and the names of their files"""
+    return config_hash({variant: {exp: sorted(Path(f).name for f in files) for exp, files in exps.items()} for variant, exps in sorted(variants.items())})
+
+
+def members_hash(cfg, variable: str, scenario: str) -> str:
+    """hash of the input of a variable/scenario: every model with the key of its file list"""
+    return config_hash({model: model_key(variants) for model, variants in members(cfg, variable, scenario).items()})
+
+
+def field_id(cfg, variable: str, aggregation: str, scenario: str) -> str:
+    """identifies the preprocessed field of a scenario (settings + archive state) for downstream hashes"""
+    store, _ = field_store(cfg, variable, aggregation)
+    return f"{store.name}-{members_hash(cfg, variable, scenario)}"
+
+
+def model_store(store: Path, scenario: str, model: str, variants: dict) -> Path:
+    return store / scenario / f"{model}_{model_key(variants)}.zarr"
+
+
 def discover_members(cmip6_root, variable: str, scenario: str) -> dict:
     """
     {model: {variant: {"historical": [files], scenario: [files]}}} for all members with
@@ -216,7 +247,8 @@ def process_model(cfg, model: str, variants: dict, variable: str, scenario: str,
     if model not in model_ids:
         raise KeyError(f"{model} has no id in configs/model_ids.yaml - append it there")
     mid = model_ids[model]
-    out_files = {agg: stores[agg] / scenario / f"{model}.zarr" for agg in fcfg["aggregations"]}
+    # named after the model's file list: new members or files give a new store, old stores stay as they are
+    out_files = {agg: model_store(stores[agg], scenario, model, variants) for agg in fcfg["aggregations"]}
     todo = [agg for agg, fl in out_files.items() if cfg["preprocess"]["overwrite"] or not fl.exists()]
     if not todo:
         return {"model": model, "status": "exists"}
@@ -291,13 +323,13 @@ def run(cfg, variables=None, scenarios=None):
                 write_yaml(record, store / "config.yaml", cfg)
             stores[agg] = store
         for scenario in scenarios:
-            members = discover_members(cfg["paths"]["inputs"]["cmip6"], variable, scenario)
-            if not members:
+            found = members(cfg, variable, scenario)
+            if not found:
                 log.info(f"no {variable} data for {scenario}")
                 continue
-            log.info(f"{variable} {scenario}: {len(members)} models, {sum(len(v) for v in members.values())} members")
+            log.info(f"{variable} {scenario}: {len(found)} models, {sum(len(v) for v in found.values())} members (input {members_hash(cfg, variable, scenario)})")
             results = Parallel(n_jobs=cfg["resources"]["n_jobs"])(
-                delayed(_process_model_safe)(cfg, model, variants, variable, scenario, stores) for model, variants in members.items()
+                delayed(_process_model_safe)(cfg, model, variants, variable, scenario, stores) for model, variants in found.items()
             )
             rows = [row for res in results for row in res.get("report", [])]
             if rows:
@@ -321,9 +353,16 @@ def _open_model(path) -> xr.Dataset:
 
 
 def open_field(cfg, variable: str, aggregation: str, scenario: str) -> xr.Dataset:
-    """all models of one variable/aggregation/scenario as one dataset (member, year, lat, lon)"""
+    """
+    all models of one variable/aggregation/scenario as one dataset (member, year, lat, lon): the stores
+    that match the current archive (models without a store, e.g. without valid members, are logged)
+    """
     store, _ = field_store(cfg, variable, aggregation)
-    files = sorted((store / scenario).glob("*.zarr"))
+    expected = {model: model_store(store, scenario, model, variants) for model, variants in members(cfg, variable, scenario).items()}
+    files = [fl for fl in expected.values() if fl.exists()]
+    missing = sorted(model for model, fl in expected.items() if not fl.exists())
+    if missing:
+        log.warning(f"{variable} {aggregation} {scenario}: no preprocessed store for {len(missing)} of {len(expected)} models ({', '.join(missing)}); run the preprocessing if the archive changed")
     if not files:
-        raise FileNotFoundError(f"no preprocessed {variable} {aggregation} {scenario} in {store}")
+        raise FileNotFoundError(f"no preprocessed {variable} {aggregation} {scenario} in {store} for the current archive")
     return xr.concat([_open_model(fl) for fl in files], dim="member", join="outer")

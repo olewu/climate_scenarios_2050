@@ -74,12 +74,17 @@ class StepOutput:
     depends on, extra identifiers (e.g. scenario) and upstream hashes
     """
 
-    def __init__(self, cfg, step, sections, upstream=None, extra=None, root_key="root"):
+    def __init__(self, cfg, step, sections, upstream=None, extra=None, root_key="root", exclude=None):
+        """`exclude`: {section: [keys]} of settings the step does not use (left out of the hash)"""
         self.cfg = cfg
         self.step = step
+        config = select(cfg, sections)
+        for section, keys in (exclude or {}).items():
+            for key in keys:
+                config[section].pop(key, None)
         self.record = {
             "step": step,
-            "config": select(cfg, sections),
+            "config": config,
             "extra": extra or {},
             "upstream": upstream or {},
         }

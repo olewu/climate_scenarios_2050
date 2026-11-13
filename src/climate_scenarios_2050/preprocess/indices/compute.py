@@ -2,12 +2,16 @@
 Compute the predictor index for all observational datasets and all CMIP6 members/scenarios,
 and the merged observational index.
 
-Output (`<root>/indices/<hash>/`):
+Output of the observations (`<root>/indices/<hash>/`, independent of the CMIP6 archive):
 - `pattern_<source>.nc`            reference pattern (EOF method)
-- `patterns_own/<dataset or model>_<scenario>.nc`   own patterns (pattern_source: own)
+- `patterns_own/<dataset>.nc`      own patterns (pattern_source: own)
 - `obs_<dataset>.nc`               index (year) per observational dataset
 - `obs_merged.nc`                  merged index + frozen harmonization parameters
+
+Output per scenario (`<root>/indices_cmip6/<hash>/`, hash includes the scenario's member list, so a
+download for one scenario leaves the others' hashes unchanged):
 - `cmip6_<scenario>.nc`            index (member, year) with model coordinates
+- `patterns_own/<model>_<scenario>.nc`
 """
 
 import logging
@@ -25,12 +29,21 @@ IMPLEMENTED = ["eof", "box"]
 
 
 def index_output(cfg) -> StepOutput:
+    """observed indices and reference pattern"""
     pred = cfg["predictor"]
-    cmip6_store, _ = cmip6.field_store(cfg, pred["variable"], pred["aggregation"])
     return StepOutput(
         cfg, "indices", sections=["predictor"],
         extra={"obs_datasets": cfg["preprocess"]["obs_datasets"], "merge": cfg["obs"]["merge"]},
-        upstream={"obs_fields": obs.obs_field_output(cfg, pred["variable"]).hash, "cmip6_fields": cmip6_store.name},
+        upstream={"obs_fields": obs.obs_field_output(cfg, pred["variable"]).hash},
+    )
+
+
+def cmip6_index_output(cfg, scenario: str) -> StepOutput:
+    """CMIP6 indices of one scenario"""
+    pred = cfg["predictor"]
+    return StepOutput(
+        cfg, "indices_cmip6", sections=["predictor"], extra={"scenario": scenario},
+        upstream={"indices": index_output(cfg).hash, "cmip6_fields": cmip6.field_id(cfg, pred["variable"], pred["aggregation"], scenario)},
     )
 
 
@@ -61,7 +74,8 @@ class IndexCalculator:
         else:
             self.reference = box.reference_stats(ref_field, self.pred["box"], self.pred["normal_period"], self.ref_clim)
 
-    def __call__(self, field: xr.DataArray, name: str) -> xr.DataArray:
+    def __call__(self, field: xr.DataArray, name: str, out: StepOutput = None) -> xr.DataArray:
+        """`out`: where own patterns are written (default: the observed-index output)"""
         field = _domain(field, self.pred["domain"])
         clim = eof.normal_period_climatology(field, self.pred["normal_period"])
         if self.pred["method"] == "box":
@@ -71,7 +85,7 @@ class IndexCalculator:
         if self.pred["pattern_source"] == "own":
             own = eof.fit_pattern(field, self.pred["normal_period"], self.pred["n_modes"], self.pred["detrend_for_fit"], source=name)
             pattern = eof.match_modes(own, self.reference, [mode])
-            fl = self.out.path(f"patterns_own/{name}.nc")
+            fl = (out or self.out).path(f"patterns_own/{name}.nc")
             if not fl.exists():
                 write_netcdf(pattern, fl, self.cfg)
             log.info(f"{name}: own mode {int(pattern['own_mode'].sel(mode=mode))} matched (pattern corr {float(pattern['pattern_corr'].sel(mode=mode)):.2f}, fit years {pattern.attrs['fit_years']})")
@@ -119,7 +133,9 @@ def run(cfg, scenarios=None):
         write_netcdf(merged, fl, cfg)
 
     for scenario in scenarios or cfg["cmip6"]["scenarios"]:
-        fl = out.path(f"cmip6_{scenario}.nc")
+        scen_out = cmip6_index_output(cfg, scenario).prepare()
+        log.info(f"{scenario} indices -> {scen_out.dir}")
+        fl = scen_out.path(f"cmip6_{scenario}.nc")
         if fl.exists():
             log.info(f"{fl} exists, skipping")
             continue
@@ -131,7 +147,7 @@ def run(cfg, scenarios=None):
         indices = []
         for model in np.unique(field["model"].values):
             sub = field.isel(member=(field["model"] == model).values).load()
-            indices.append(calc(sub, f"{model}_{scenario}").compute())
+            indices.append(calc(sub, f"{model}_{scenario}", scen_out).compute())
         idx = xr.concat(indices, dim="member")
         write_netcdf(idx.to_dataset(), fl, cfg)
         log.info(f"{scenario}: index for {idx.sizes['member']} members")
@@ -145,6 +161,6 @@ def open_obs_index(cfg, dataset: str) -> xr.DataArray:
 
 
 def open_cmip6_index(cfg, scenario: str) -> xr.DataArray:
-    out = index_output(cfg)
+    out = cmip6_index_output(cfg, scenario)
     with xr.open_dataset(out.path(f"cmip6_{scenario}.nc")) as ds:
         return ds["index"].load()

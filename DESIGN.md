@@ -88,6 +88,21 @@ One configurable generator:
 - obs are cut at init; model series are filtered over their full length by default (`full`), option `cut`
 - synthetic AR(1) "observations" as null test, for any configuration
 
+### Significance of the wind skill maps (step 5, `evaluation.significance`)
+- Null: no information beyond M0. Spatially coherent phase-randomized surrogates of the observed
+  annual internal wind (one random phase rotation per frequency for all grid points: keeps the
+  autocorrelation and the spatial covariance). Model-based parts of the predictions stay fixed.
+- The leave-out split is repeated for every surrogate (exact, as linear operators per init/window):
+  keeping the leave-out offsets fixed breaks their dependence on the anomalies and makes
+  persistence-type methods look significant everywhere.
+- Statistics: dCRPSS = CRPSS_m - CRPSS_M0 (primary), dcorr, corr_anom = corr(pred - M0, obs - M0)
+  (= corr(P, W) of window levels for M2b/M3b). One-sided local p, FDR (Benjamini-Hochberg) at
+  q = 2 alpha (Wilks 2016) for stippling; field tests with the area-weighted mean and the area
+  fraction > 0. `significance.nc` in the evaluation folder.
+- Calibrated on synthetic AR(1) fields (rejection rate 0.05 at 0.05). Northern Spain has a residual
+  trend in the internal wind (0.43 m/s / 85 y) that the stationary null does not represent.
+- Cost: ~1.7 h per scenario and wind variable with 1000 surrogates and 4 workers (0.25 deg grid).
+
 ### Predictors
 Generic index interface: an index = (source variable, season/aggregation, domain, method).
 Methods: EOF mode k projected on a common pattern (implemented first), box difference
@@ -109,6 +124,14 @@ can be added later.
 - Historical runs are used until Dec 2014, scenario runs from Jan 2015 (some historical files
   extend beyond 2014, e.g. FGOALS-g3).
 - Output: `/datalake/NS9873K/DATA/CMIP6/processed/` (currently empty).
+- The archive state is part of the hashes: each model's regridded store is named
+  `<model>_<key>.zarr`, with the key a hash of its members and their file names. New members or
+  files give a new store (old stores stay), and only the changed models are regridded again.
+  Downstream, the member list enters per scenario: the CMIP6 indices have their own output per
+  scenario (`indices_cmip6/<hash>/`, separate from the observed indices in `indices/<hash>/`), and the
+  split of a scenario depends on that scenario's psl and sfcWind member lists. A download for one
+  scenario therefore leaves the hashes of the other scenarios unchanged. Run the preprocessing after
+  a download has finished, not while files are still arriving.
 
 ### Output, safety, environment
 - All other output: `/datalake/NS9873K/users/owul/climate_scenarios_v2/` (currently empty).

@@ -17,8 +17,9 @@ Targets:
             M2a/M3a: minus the relative change of the sfcWind MMEM
 M2a/M3a are only available for wind speed.
 
-Outputs: `scores_<wind>.nc` (fc_method, target, window, latitude, longitude), `sites_<wind>.nc` with
-block-bootstrap intervals of the correlation at the sites of `evaluation.sites`.
+Outputs: `scores.nc` (fc_method, target, window, latitude, longitude), `sites.nc` with
+block-bootstrap intervals of the correlation at the sites of `evaluation.sites`, and
+`significance.nc`: local and field significance of the skill beyond M0 (see `surrogates.py`).
 """
 
 import logging
@@ -152,7 +153,7 @@ def build_predictions(cfg, scenario, wind_variable):
         targets[kind] = target
         spread = persistence_spread(target, windows)
         methods[kind]["M1"] = (xr.zeros_like(target), spread)
-    return targets, methods
+    return targets, methods, to_units
 
 
 def _site_row(cfg, site, window, length, kind, name, mean, target):
@@ -181,7 +182,7 @@ def run_case(cfg, scenario, wind_variable):
     out = wind_evaluation_output(cfg, scenario, wind_variable).prepare()
     log.info(f"wind evaluation {scenario} {wind_variable} -> {out.dir}")
     windows = [tuple(w) for w in cfg["target"]["windows"]]
-    targets, methods = build_predictions(cfg, scenario, wind_variable)
+    targets, methods, to_units = build_predictions(cfg, scenario, wind_variable)
     quantiles = cfg["evaluation"]["quantiles"]
     if not out.exists("scores.nc"):
         kinds = []
@@ -193,6 +194,10 @@ def run_case(cfg, scenario, wind_variable):
         write_netcdf(scores, out.path("scores.nc"), cfg, compress=True)
     if not out.exists("sites.nc"):
         write_netcdf(site_table(cfg, targets, methods, windows), out.path("sites.nc"), cfg)
+    if cfg["evaluation"].get("significance", {}).get("enabled") and not out.exists("significance.nc"):
+        from climate_scenarios_2050.evaluate.surrogates import surrogate_test
+
+        write_netcdf(surrogate_test(cfg, scenario, wind_variable, targets, methods, to_units), out.path("significance.nc"), cfg, compress=True)
     from climate_scenarios_2050.plotting.wind import plot_wind_evaluation
     plot_wind_evaluation(cfg, out, scenario, wind_variable)
     return out

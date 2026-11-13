@@ -17,7 +17,7 @@ from climate_scenarios_2050.core.config import load_config
 
 log = logging.getLogger("climate_scenarios_2050")
 
-STEPS = ["preprocess", "split", "hindcast-nao", "evaluate-nao", "linear-model", "hindcast-wind", "evaluate-wind", "forecast", "update-index"]
+STEPS = ["cmip6-inventory", "cmip6-download", "preprocess", "split", "hindcast-nao", "evaluate-nao", "linear-model", "hindcast-wind", "evaluate-wind", "forecast", "update-index"]
 
 
 def setup_logging(cfg, step):
@@ -30,6 +30,19 @@ def setup_logging(cfg, step):
         handlers=[logging.StreamHandler(), logging.FileHandler(log_file)],
     )
     log.info(f"log file: {log_file}")
+
+
+def run_cmip6_inventory(cfg, args):
+    from climate_scenarios_2050.cmip_retrieval import inventory
+
+    inventory.run(cfg, variables=args.variable or None, experiments=args.scenario or None)
+
+
+def run_cmip6_download(cfg, args):
+    from climate_scenarios_2050.cmip_retrieval import download
+
+    download.run(cfg, target=args.target, inventory=args.inventory, variables=args.variable or None,
+                 experiments=args.scenario or None, max_datasets=args.max_datasets)
 
 
 def run_preprocess(cfg, args):
@@ -112,8 +125,11 @@ def main(argv=None):
     parser.add_argument("--config", action="append", default=[], help="override file(s), merged in order")
     parser.add_argument("--paths", default=None, help="alternative paths.yaml")
     parser.add_argument("--part", action="append", help="preprocess: cmip6 | obs | wind | indices (default: all)")
-    parser.add_argument("--variable", action="append", help="preprocess: restrict to variable(s)")
-    parser.add_argument("--scenario", action="append", help="restrict to scenario(s)")
+    parser.add_argument("--variable", action="append", help="preprocess, cmip6-*: restrict to variable(s)")
+    parser.add_argument("--scenario", action="append", help="restrict to scenario(s) (cmip6-*: experiments, incl. historical)")
+    parser.add_argument("--target", help="cmip6-download: archive root to write to (default: paths.inputs.cmip6)")
+    parser.add_argument("--inventory", help="cmip6-download: inventory folder with plan.csv (default: the latest)")
+    parser.add_argument("--max-datasets", type=int, help="cmip6-download: only the first n planned datasets (testing)")
     parser.add_argument("--init-year", type=int, help="forecast: initialization year")
     parser.add_argument("--window", action="append", help="forecast: target window a-b in lead years, e.g. 1-10 (default: target.windows)")
     parser.add_argument("--wind", help="forecast: wsp100 | energy (default: obs.wind_variable)")
@@ -128,7 +144,11 @@ def main(argv=None):
     log.info(f"step {args.step}, overrides {args.config}")
     dask.config.set(scheduler="threads", num_workers=cfg["resources"]["dask_threads"])
 
-    if args.step == "preprocess":
+    if args.step == "cmip6-inventory":
+        run_cmip6_inventory(cfg, args)
+    elif args.step == "cmip6-download":
+        run_cmip6_download(cfg, args)
+    elif args.step == "preprocess":
         run_preprocess(cfg, args)
     elif args.step == "split":
         run_split(cfg, args)
