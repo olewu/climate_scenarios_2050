@@ -4,5 +4,5 @@ cmip6:
 predictor:
   name: ea
   mode: 2
-  sign_reference_point: {lon: -20, lat: 55}
+  sign_reference_point: {lon: -20, lat: 55, sign: negative}   # EA+: low pressure west of the British Isles (CPC)
 

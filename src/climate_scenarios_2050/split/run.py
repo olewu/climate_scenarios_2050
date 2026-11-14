@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 
-from climate_scenarios_2050.core.config import active_targets, target_spec
+from climate_scenarios_2050.core.config import active_targets, index_cfg, index_names, lm_predictors, primary_index, target_spec
 from climate_scenarios_2050.core.io import StepOutput, write_netcdf
 from climate_scenarios_2050.preprocess import cmip6, obs
 from climate_scenarios_2050.preprocess.indices.compute import cmip6_index_output, index_output, obs_index_names, open_cmip6_index, open_obs_index
@@ -32,12 +32,25 @@ from climate_scenarios_2050.split import forced as fc
 log = logging.getLogger(__name__)
 
 
-def split_output(cfg, scenario: str) -> StepOutput:
+def split_output(cfg, scenario: str, index: str = None) -> StepOutput:
+    """split of one scenario and index (default: the primary index)"""
+    cfg = index_cfg(cfg, index)
     return StepOutput(
         cfg, "split", sections=["split", "target"],
         extra={"scenario": scenario, "weighting": cfg["cmip6"]["weighting"]},
         upstream={"indices": index_output(cfg).hash, "cmip6_indices": cmip6_index_output(cfg, scenario).hash},
     )
+
+
+def predictor_split_hashes(cfg, scenario: str):
+    """
+    upstream record of the steps using the linear-model predictors: the primary split's hash with one
+    predictor (as in a single-index configuration), otherwise {index: hash} of the primary and the predictors
+    """
+    names = lm_predictors(cfg)
+    if names == [primary_index(cfg)]:
+        return split_output(cfg, scenario).hash
+    return {name: split_output(cfg, scenario, name).hash for name in dict.fromkeys([primary_index(cfg), *names])}
 
 
 def target_file(cfg, target_variable: str) -> str:
@@ -107,9 +120,12 @@ def ensure_target_coefficients(cfg, scenario: str, out, basis, target_variable: 
     return fl
 
 
-def run_scenario(cfg, scenario: str):
+def run_scenario(cfg, scenario: str, index: str = None):
+    """split of one index; the observed targets are split with the primary index's basis only"""
+    with_targets = (index or primary_index(cfg)) == primary_index(cfg)
+    cfg = index_cfg(cfg, index)
     out = split_output(cfg, scenario).prepare()
-    log.info(f"split {scenario} -> {out.dir}")
+    log.info(f"split {cfg['predictor']['name']} {scenario} -> {out.dir}")
     index = open_cmip6_index(cfg, scenario)
     mmem = fc.multi_model_mean(index, cfg["cmip6"]["weighting"], cfg["split"]["min_model_fraction"])
     basis = fc.make_basis(mmem, cfg["split"])
@@ -123,8 +139,9 @@ def run_scenario(cfg, scenario: str):
         if not out.exists(f"obs_{name}.nc"):
             write_netcdf(index_coefficients(open_obs_index(cfg, name), basis, cfg), out.path(f"obs_{name}.nc"), cfg)
 
-    for target_variable in available_target_variables(cfg):
-        ensure_target_coefficients(cfg, scenario, out, basis, target_variable)
+    if with_targets:
+        for target_variable in available_target_variables(cfg):
+            ensure_target_coefficients(cfg, scenario, out, basis, target_variable)
 
     log.info(f"split {scenario} done")
     return out
@@ -132,14 +149,17 @@ def run_scenario(cfg, scenario: str):
 
 def run(cfg, scenarios=None):
     for scenario in scenarios or cfg["cmip6"]["scenarios"]:
-        run_scenario(cfg, scenario)
+        for index in index_names(cfg):
+            run_scenario(cfg, scenario, index)
 
 
 class SplitResults:
-    """access to the split of one scenario"""
+    """access to the split of one scenario and index (default: the primary index, which also holds the targets)"""
 
-    def __init__(self, cfg, scenario: str):
+    def __init__(self, cfg, scenario: str, index: str = None):
+        cfg = index_cfg(cfg, index)
         self.cfg = cfg
+        self.index = cfg["predictor"]["name"]
         self.scenario = scenario
         self.out = split_output(cfg, scenario)
         with xr.open_dataset(self.out.path("basis.nc")) as ds:

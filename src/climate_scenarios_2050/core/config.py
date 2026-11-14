@@ -82,7 +82,17 @@ def validate(cfg: dict):
             raise ValueError(f"targets.{name}: preprocess.fields.{spec['cmip6']} needs an `annual` aggregation")
     if "obs" in cfg and cfg["obs"].get("target_variable") not in cfg.get("region", {}).get("targets", []):
         raise ValueError(f"obs.target_variable {cfg['obs'].get('target_variable')} is not in region.targets")
-    pred = cfg.get("predictor")
+    if cfg.get("predictor"):
+        validate_indices(cfg)
+        for name in index_names(cfg):
+            _validate_predictor(index_cfg(cfg, name), sources, fields)
+    for name, fcfg in fields.items():
+        if fcfg.get("global_mean") not in (None, False, True, "ocean"):
+            raise ValueError(f"preprocess.fields.{name}.global_mean must be true, false or ocean")
+
+
+def _validate_predictor(cfg: dict, sources: dict, fields: dict):
+    pred = cfg["predictor"]
     if pred:
         pf = predictor_field(cfg)
         if pf not in fields:
@@ -91,6 +101,9 @@ def validate(cfg: dict):
             raise ValueError(f"preprocess.fields.{pf} has variable {field_variable(cfg, pf)}, the predictor {pred['variable']}")
         if pred["aggregation"] not in fields[pf]["aggregations"]:
             raise ValueError(f"predictor.aggregation {pred['aggregation']} is not an aggregation of preprocess.fields.{pf}")
+        point = pred.get("sign_reference_point")
+        if point is not None and point.get("sign", "positive") not in ("positive", "negative"):
+            raise ValueError("predictor.sign_reference_point.sign must be positive or negative")
         if pred.get("mask") not in (None, "ocean"):
             raise ValueError("predictor.mask must be null or ocean")
         for ds in pred["obs_datasets"]:
@@ -98,9 +111,6 @@ def validate(cfg: dict):
                 raise ValueError(f"obs_sources.{ds} does not provide the predictor variable {pred['variable']}")
         if pred.get("remove_global_mean") and not fields[pf].get("global_mean"):
             raise ValueError(f"predictor.remove_global_mean needs preprocess.fields.{pf}.global_mean (true or ocean)")
-    for name, fcfg in fields.items():
-        if fcfg.get("global_mean") not in (None, False, True, "ocean"):
-            raise ValueError(f"preprocess.fields.{name}.global_mean must be true, false or ocean")
         merge = cfg.get("obs", {}).get("merge")
         if merge:
             for ds in merge["datasets"]:
@@ -120,6 +130,71 @@ def target_spec(cfg: dict, name: str) -> dict:
     return cfg["targets"][name]
 
 
+#---------------several indices--------------#
+def index_names(cfg: dict) -> list:
+    """names of the indices; the first is the primary index"""
+    indices = cfg["predictor"].get("indices")
+    return list(indices) if indices else [cfg["predictor"]["name"]]
+
+
+def primary_index(cfg: dict) -> str:
+    return index_names(cfg)[0]
+
+
+def index_cfg(cfg: dict, name: str = None) -> dict:
+    """
+    configuration of one index: the predictor block with the index's overrides and `indices: null`, so
+    that every per-index step (patterns, indices, split, index evaluation) hashes exactly like a
+    single-index configuration of that index. Without `predictor.indices` the configuration itself.
+    """
+    name = name or primary_index(cfg)
+    pred = cfg["predictor"]
+    indices = pred.get("indices")
+    if not indices:
+        if name != pred["name"]:
+            raise KeyError(f"index {name} is not configured (predictor.name is {pred['name']})")
+        return cfg
+    if name not in indices:
+        raise KeyError(f"index {name} is not in predictor.indices ({list(indices)})")
+    out = dict(cfg)
+    base = {k: v for k, v in pred.items() if k != "indices"}
+    out["predictor"] = deep_merge(base, indices[name] or {})
+    out["predictor"]["name"] = name
+    out["predictor"]["indices"] = None
+    return out
+
+
+def match_weights(cfg: dict) -> dict:
+    """{index: weight} of the analogue matching, weights summing to one"""
+    weights = cfg["analogues"].get("match_weights") or {primary_index(cfg): 1.0}
+    weights = {k: float(v) for k, v in weights.items() if float(v) > 0}
+    total = sum(weights.values())
+    return {k: v / total for k, v in weights.items()}
+
+
+def lm_predictors(cfg: dict) -> list:
+    """indices of the linear model"""
+    return list(cfg["linear_model"].get("predictors") or [primary_index(cfg)])
+
+
+def hindcast_indices(cfg: dict) -> list:
+    """indices the analogue hindcast provides: the primary, the matched ones and the linear model's"""
+    names = [primary_index(cfg), *match_weights(cfg), *lm_predictors(cfg)]
+    return list(dict.fromkeys(names))
+
+
+def validate_indices(cfg: dict):
+    names = index_names(cfg)
+    for key, used in [("analogues.match_weights", match_weights(cfg)), ("linear_model.predictors", lm_predictors(cfg))]:
+        unknown = [n for n in used if n not in names]
+        if unknown:
+            raise ValueError(f"{key}: {unknown} not in the configured indices {names}")
+    if not match_weights(cfg):
+        raise ValueError("analogues.match_weights: no positive weight")
+    if float(cfg["linear_model"].get("ridge") or 0) < 0:
+        raise ValueError("linear_model.ridge must be >= 0")
+
+
 def predictor_field(cfg: dict) -> str:
     """name of the predictor's entry in preprocess.fields (`predictor.field`, default: its variable)"""
     return cfg["predictor"].get("field") or cfg["predictor"]["variable"]
@@ -135,8 +210,8 @@ def cmip6_table(cfg: dict, variable: str) -> str:
 
 
 def used_fields(cfg: dict) -> list:
-    """fields (preprocess.fields entries) the configuration needs: the predictor's and the active targets' CMIP6 fields"""
-    names = [predictor_field(cfg)]
+    """fields (preprocess.fields entries) the configuration needs: the indices' and the active targets' CMIP6 fields"""
+    names = list(dict.fromkeys(predictor_field(index_cfg(cfg, name)) for name in index_names(cfg)))
     for name in active_targets(cfg):
         var = target_spec(cfg, name).get("cmip6")
         if var and var not in names:

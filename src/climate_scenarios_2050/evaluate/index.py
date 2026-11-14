@@ -21,7 +21,8 @@ import numpy as np
 import xarray as xr
 from joblib import Parallel, delayed
 
-from climate_scenarios_2050.analogues.generate import hindcast_output, init_years, lead_axis, matching_obs, open_hindcast
+from climate_scenarios_2050.analogues.generate import hindcast_index, hindcast_output, init_years, lead_axis, matching_obs, open_hindcast
+from climate_scenarios_2050.core.config import hindcast_indices, index_cfg, match_weights, primary_index
 from climate_scenarios_2050.analogues.matching import align_leads, running_mean
 from climate_scenarios_2050.baselines import index as baselines
 from climate_scenarios_2050.core.io import StepOutput, write_netcdf
@@ -35,9 +36,13 @@ from climate_scenarios_2050.split.run import SplitResults
 log = logging.getLogger(__name__)
 
 
-def evaluation_output(cfg, scenario) -> StepOutput:
+def evaluation_output(cfg, scenario, index: str = None) -> StepOutput:
+    """evaluation of one index of the hindcast (default: the primary index)"""
+    index = index or primary_index(cfg)
+    # several indices in the hindcast: one evaluation per index
+    extra = {"index": index} if hindcast_indices(cfg) != [primary_index(cfg)] else {}
     # the significance test of the target evaluation is not used here
-    return StepOutput(cfg, "evaluate_index", sections=["evaluation", "baselines"], upstream={"hindcast_index": hindcast_output(cfg, scenario).hash}, exclude={"evaluation": ["significance"]})
+    return StepOutput(cfg, "evaluate_index", sections=["evaluation", "baselines"], extra=extra, upstream={"hindcast_index": hindcast_output(cfg, scenario).hash}, exclude={"evaluation": ["significance"]})
 
 
 def lead_window_change(hc: xr.DataArray, windows, reference_length: int) -> xr.DataArray:
@@ -68,11 +73,11 @@ def obs_window_change(series, design, coef, windows, reference_length) -> xr.Dat
     return out.rename("obs_change")
 
 
-def build_products(cfg, scenario, split, leads) -> dict:
-    """all hindcasts (init_year, member, lead) that are verified"""
-    hindcast = open_hindcast(cfg, scenario)
+def build_products(cfg, scenario, split, leads, hindcast=None) -> dict:
+    """all hindcasts (init_year, member, lead) of one index that are verified (`cfg`: the index's configuration)"""
+    hindcast = open_hindcast(cfg, scenario) if hindcast is None else hindcast
     inits = hindcast.init_year.values
-    products = {"analogue": hindcast["index"].rename(rank="member")}
+    products = {"analogue": hindcast_index(hindcast, cfg["predictor"]["name"]).rename(rank="member")}
 
     internal = split.cmip6_internal().transpose("member", "year")
     n_members = internal.sizes["member"]
@@ -200,16 +205,22 @@ def synthetic_null(cfg, synth: xr.Dataset, windows, leads_eval) -> xr.Dataset:
     return continuous.rename({"corr": "continuous_corr_p95", "nrmse": "continuous_nrmse_p95"}).merge(win.rename({"corr": "window_corr_p95", "nrmse": "window_nrmse_p95"}))
 
 
-def run_scenario(cfg, scenario):
-    out = evaluation_output(cfg, scenario).prepare()
-    log.info(f"NAO evaluation {scenario} -> {out.dir}")
+def run_scenario(cfg, scenario, index: str = None):
+    index = index or primary_index(cfg)
+    out = evaluation_output(cfg, scenario, index).prepare()
+    log.info(f"index evaluation {index} {scenario} -> {out.dir}")
+    hindcast = open_hindcast(cfg, scenario)
+    hc_out = hindcast_output(cfg, scenario)
+    matched = list(match_weights(cfg))
+    with_null = hc_out.exists("synthetic.nc") and matched == [index]
+    cfg = index_cfg(cfg, index)
     split = SplitResults(cfg, scenario)
     name = cfg["obs"]["matching_index"]
     leads = lead_axis(cfg)
     windows = [tuple(w) for w in cfg["target"]["windows"]]
     series = open_obs_index(cfg, name).dropna("year")
     design = fc.design_matrix(split.basis, series.year.values)
-    products = build_products(cfg, scenario, split, leads)
+    products = build_products(cfg, scenario, split, leads, hindcast)
     inits = products["analogue"].init_year.values
 
     ncfg = cfg["evaluation"]["index_continuous"]
@@ -225,9 +236,9 @@ def run_scenario(cfg, scenario):
         obs_change = obs_window_change(series, design, split.obs_coef(name, "coef_window_lag0"), windows, cfg["target"]["reference_length"])
         write_netcdf(window_evaluation(cfg, products, obs_change, windows), out.path("windows.nc"), cfg)
 
-    hc_out = hindcast_output(cfg, scenario)
-    if hc_out.exists("synthetic.nc") and not out.exists("null.nc"):
-        write_netcdf(synthetic_null(cfg, open_hindcast(cfg, scenario, "synthetic.nc"), windows, leads_eval), out.path("null.nc"), cfg)
+    if with_null and not out.exists("null.nc"):
+        with xr.open_dataset(hc_out.path("synthetic.nc")) as ds:
+            write_netcdf(synthetic_null(cfg, ds.load(), windows, leads_eval), out.path("null.nc"), cfg)
 
     from climate_scenarios_2050.plotting.index import plot_evaluation
     plot_evaluation(cfg, out, scenario)
@@ -236,4 +247,5 @@ def run_scenario(cfg, scenario):
 
 def run(cfg, scenarios=None):
     for scenario in scenarios or cfg["cmip6"]["scenarios_hindcast"]:
-        run_scenario(cfg, scenario)
+        for index in hindcast_indices(cfg):
+            run_scenario(cfg, scenario, index)

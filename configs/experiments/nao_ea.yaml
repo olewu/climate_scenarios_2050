@@ -1,0 +1,13 @@
+# NAO and East Atlantic pattern (modes 1 and 2 of the same DJFM SLP EOF): analogues matched on both,
+# linear model on both. Each index has its own pattern, split and evaluation; the NAO is the primary index.
+predictor:
+  indices:
+    nao: {mode: 1}
+    ea: {mode: 2, sign_reference_point: {lat: 55, lon: -20, sign: negative}}   # EA+: low pressure west of the British Isles (CPC)
+
+analogues:
+  match_weights: {nao: 0.5, ea: 0.5}
+
+linear_model:
+  predictors: [nao, ea]
+  ridge: 0.0

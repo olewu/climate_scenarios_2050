@@ -18,6 +18,13 @@ from climate_scenarios_2050.core.config import config_hash, select
 
 log = logging.getLogger(__name__)
 
+# section -> {key: neutral value}: left out of the hash while they have this value
+HASH_NEUTRAL = {
+    "predictor": {"indices": None},
+    "analogues": {"match_weights": None},
+    "linear_model": {"predictors": None, "ridge": 0.0},
+}
+
 
 def output_roots(cfg) -> list:
     return [Path(p).resolve() for p in cfg["paths"]["outputs"].values()]
@@ -79,6 +86,11 @@ class StepOutput:
         self.cfg = cfg
         self.step = step
         config = select(cfg, sections)
+        # settings added later that only enter the hash when they are used (older hashes stay valid)
+        for section, neutral in HASH_NEUTRAL.items():
+            for key, value in neutral.items():
+                if section in config and key in config[section] and config[section][key] == value:
+                    config[section].pop(key)
         for section, keys in (exclude or {}).items():
             for key in keys:
                 config[section].pop(key, None)

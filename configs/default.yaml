@@ -111,12 +111,17 @@ predictor:
   detrend_for_fit: true                # linearly detrend the fitting sample (as before)
   pattern_source: ERA5                 # ERA5 | HadSLP | 20CR | own (each model its own pattern)
   n_modes: 10
-  sign_reference_point: {lat: 35.25, lon: -20.25}   # positive pattern value here (Azores high for NAO+)
+  sign_reference_point: {lat: 35.25, lon: -20.25}   # positive pattern value here (Azores high for NAO+); add sign: negative for the opposite
   box: null                            # for method: box, e.g. {south: {...}, north: {...}}
   obs_datasets: [ERA5, HadSLP, 20CR]   # observational datasets the index is computed for (keys of obs_sources)
   remove_global_mean: false            # subtract the global-mean field before the EOF/projection (e.g. PDO with SST)
   mask: null                           # null | ocean: restrict the index field to the ocean (mask from ERA5 SST)
   reference_skill: {lead: 5.5, low: 0.57, high: 0.79, label: DCPP (LY2-9)}   # marker in the skill figure (null: none)
+  # Several indices: {name: {overrides of this block}}, e.g.
+  #   {nao: {mode: 1}, ea: {mode: 2, sign_reference_point: {lat: 55, lon: -20, sign: negative}}}
+  # Every index gets its own pattern, split and evaluation; the first one is the primary index (forced
+  # part of the targets, figures). null: one index, this block.
+  indices: null
 
 obs:
   matching_index: merged               # merged | one of predictor.obs_datasets
@@ -146,6 +151,8 @@ analogues:
   min_window_coverage: 1.0             # fraction of the window a member must have data for
   first_init: null                     # null: first year with a complete matching window
   M: 100
+  match_weights: null                  # {index: weight}: joint matching on several indices, the weighted mean of the
+                                       # per-index scores (CORR) or squared errors (RMSE); null: the primary index
   max_lag: 25                          # shift selection
   preselection: null                   # null | varsplit_<N>y | Smith_incl_best | Smith_excl_worst | NAO_AR1_D2.5
   model_filter_at_init: full           # full: centred filter over the whole model series (no observed future is used, the
@@ -175,6 +182,8 @@ target:
 linear_model:
   leave_out: overlap_target            # exclude training windows overlapping the target window
   min_samples: 20                      # no fit with fewer (overlapping) training windows
+  predictors: null                     # indices of the (multiple) regression; null: the primary index
+  ridge: 0.0                           # ridge penalty, relative to the predictors' variance (0: least squares)
 
 #---------------step 5/6: target methods--------------#
 forced_target: index_mmem              # forced part of M0/M2b/M3b: index_mmem (a) | cmip6_mmem (b, needs a CMIP6 variable) | none (c)

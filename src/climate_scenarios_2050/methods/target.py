@@ -2,8 +2,9 @@
 Step 5a: what the target methods need from the CMIP6 ensembles, per scenario and target
 (`<root>/hindcast_target/<hash>/`). Ensembles: `all` (all members) and `analogue` (selected members).
 
-- `index_stats.nc`: mean and std over the members of the predictor window mean, (ensemble, init_year,
-  window). Seasons Y+a-lag ... Y+b-lag for target window (a, b). Used by M2b/M3b.
+- `index_stats.nc`: mean, std and covariance over the members of the window means of the linear-model
+  predictors, (ensemble, init_year, window, predictor[, predictor2]). Seasons Y+a-lag ... Y+b-lag for
+  target window (a, b). Used by M2b/M3b.
 - `cmip6.nc`: mean and std over the members of the change of the target's CMIP6 variable (`cmip6` of the
   target, e.g. sfcWind for wsp100) in the window against each member's own reference, (ensemble,
   init_year, window, lat, lon); relative [%] or absolute as the target's `change`. Used by M2a/M3a.
@@ -18,13 +19,13 @@ import logging
 import numpy as np
 import xarray as xr
 
-from climate_scenarios_2050.analogues.generate import hindcast_output, open_hindcast
+from climate_scenarios_2050.analogues.generate import hindcast_index, hindcast_output, open_hindcast
 from climate_scenarios_2050.analogues.matching import align_leads
-from climate_scenarios_2050.core.config import field_variable, target_spec
+from climate_scenarios_2050.core.config import field_variable, lm_predictors, target_spec
 from climate_scenarios_2050.core.io import StepOutput, write_netcdf
 from climate_scenarios_2050.core.timeconv import window_label
 from climate_scenarios_2050.preprocess import cmip6
-from climate_scenarios_2050.split.run import SplitResults, available_target_variables, split_output
+from climate_scenarios_2050.split.run import SplitResults, available_target_variables, predictor_split_hashes
 
 log = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ CMIP6_AGGREGATION = "annual"
 
 def target_hindcast_output(cfg, scenario: str, target_variable: str) -> StepOutput:
     spec = target_spec(cfg, target_variable)
-    upstream = {"hindcast_index": hindcast_output(cfg, scenario).hash, "split": split_output(cfg, scenario).hash}
+    upstream = {"hindcast_index": hindcast_output(cfg, scenario).hash, "split": predictor_split_hashes(cfg, scenario)}
     if spec.get("cmip6"):
         upstream["cmip6_fields"] = cmip6.field_id(cfg, spec["cmip6"], CMIP6_AGGREGATION, scenario)
     return StepOutput(
@@ -85,22 +86,57 @@ def weighted_mean_std(values: np.ndarray, weights: np.ndarray):
     return mean, np.sqrt(var)
 
 
-def index_stats(cfg, split, hindcast, inits, windows) -> xr.Dataset:
+def weighted_mean_cov(values: np.ndarray, weights: np.ndarray):
+    """
+    weighted mean (predictor) and covariance (predictor, predictor) of `values` (member, predictor);
+    members with a missing value are left out and the weights renormalized
+    """
+    valid = np.isfinite(values).all(axis=1)
+    p = values.shape[1]
+    if not valid.any():
+        return np.full(p, np.nan), np.full((p, p), np.nan)
+    w = weights[valid] / weights[valid].sum()
+    x = values[valid]
+    mean = w @ x
+    anom = x - mean
+    return mean, (w[:, None] * anom).T @ anom
+
+
+def predictor_members(cfg, scenario: str):
+    """internal CMIP6 series of the linear-model predictors (predictor, member, year) of the members with all of them"""
+    names = lm_predictors(cfg)
+    internals = {n: SplitResults(cfg, scenario, n).cmip6_internal().transpose("member", "year") for n in names}
+    common = sorted(set.intersection(*[set(i.member.values.astype(str)) for i in internals.values()]))
+    first = internals[names[0]].sel(member=common)
+    stack = np.stack([internals[n].sel(member=common).reindex(year=first.year).values for n in names])
+    return stack, first
+
+
+def index_stats(cfg, scenario, hindcast, inits, windows) -> xr.Dataset:
     lag = cfg["target"]["predictor_lag"]
-    internal = split.cmip6_internal().transpose("member", "year")
-    weights = member_weights(internal["model_id"].values, cfg["cmip6"]["weighting"])
+    names = lm_predictors(cfg)
+    stack, first = predictor_members(cfg, scenario)
+    weights = member_weights(first["model_id"].values, cfg["cmip6"]["weighting"])
+    years = first.year.values
     leads = hindcast.lead.values
-    mean = np.full((2, len(inits), len(windows)), np.nan)
-    std = np.full_like(mean, np.nan)
+    n_pred = len(names)
+    mean = np.full((2, len(inits), len(windows), n_pred), np.nan)
+    cov = np.full((2, len(inits), len(windows), n_pred, n_pred), np.nan)
+    analogues = [hindcast_index(hindcast, n) for n in names]
     for ii, init in enumerate(inits):
-        all_members = align_leads(internal.values, internal.year.values, int(init), leads)
-        analogue = hindcast["index"].sel(init_year=init).values
+        all_members = [align_leads(stack[k], years, int(init), leads) for k in range(n_pred)]
+        analogue = [a.sel(init_year=init).values for a in analogues]
+        n_ana = analogue[0].shape[0]
         for iw, (a, b) in enumerate(windows):
             use = (leads >= a - lag) & (leads <= b - lag)
-            mean[0, ii, iw], std[0, ii, iw] = weighted_mean_std(_window(all_members, use), weights)
-            mean[1, ii, iw], std[1, ii, iw] = weighted_mean_std(_window(analogue, use), np.full(analogue.shape[0], 1 / analogue.shape[0]))
-    coords = {"ensemble": ["all", "analogue"], "init_year": inits, "window": [window_label(w) for w in windows]}
-    return xr.Dataset({"mean": (tuple(coords), mean), "std": (tuple(coords), std)}, coords=coords)
+            x_all = np.stack([_window(v, use) for v in all_members], axis=1)
+            x_ana = np.stack([_window(v, use) for v in analogue], axis=1)
+            mean[0, ii, iw], cov[0, ii, iw] = weighted_mean_cov(x_all, weights)
+            mean[1, ii, iw], cov[1, ii, iw] = weighted_mean_cov(x_ana, np.full(n_ana, 1 / n_ana))
+    coords = {"ensemble": ["all", "analogue"], "init_year": inits, "window": [window_label(w) for w in windows], "predictor": names, "predictor2": names}
+    dims = ("ensemble", "init_year", "window", "predictor")
+    std = np.sqrt(np.diagonal(cov, axis1=-2, axis2=-1))
+    return xr.Dataset({"mean": (dims, mean), "std": (dims, std), "cov": ((*dims, "predictor2"), cov)}, coords=coords)
 
 
 def _window(values, use):
@@ -173,10 +209,9 @@ def run_scenario(cfg, scenario: str, target_variable: str, inits=None):
     log.info(f"target hindcast inputs {scenario} {target_variable} -> {out.dir}")
     windows = [tuple(w) for w in cfg["target"]["windows"]]
     hindcast = open_hindcast(cfg, scenario)
-    split = SplitResults(cfg, scenario)
     inits = hindcast.init_year.values if inits is None else inits
     if not out.exists("index_stats.nc"):
-        write_netcdf(index_stats(cfg, split, hindcast, inits, windows), out.path("index_stats.nc"), cfg)
+        write_netcdf(index_stats(cfg, scenario, hindcast, inits, windows), out.path("index_stats.nc"), cfg)
     if not spec.get("cmip6") or (out.exists("cmip6.nc") and out.exists("cmip6_mmem.nc")):
         return out
     field = open_cmip6_target(cfg, spec["cmip6"], scenario)

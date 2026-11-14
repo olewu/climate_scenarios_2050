@@ -117,35 +117,56 @@ def member_scores_for_lag(model, years, obs_win, init, cfg, lag, measure, mask):
     return filtered, score
 
 
-def select_members(obs: np.ndarray, obs_years: np.ndarray, model: np.ndarray, years: np.ndarray, init: int, cfg: dict) -> dict:
+def combine(scores_k: np.ndarray, weights: np.ndarray, measure: str) -> np.ndarray:
+    """
+    joint score of several indices (index first): weighted mean of the correlations, or the root of the
+    weighted mean of the squared errors (RMSE); NaN if any index has no score
+    """
+    w = weights.reshape(-1, *([1] * (scores_k.ndim - 1)))
+    if measure == "RMSE":
+        return np.sqrt((w * scores_k**2).sum(axis=0))
+    return (w * scores_k).sum(axis=0)
+
+
+def select_members(obs: np.ndarray, obs_years: np.ndarray, model: np.ndarray, years: np.ndarray, init: int, cfg: dict, weights=None) -> dict:
     """
     the configured selection for one init year; `obs` and `model` are unfiltered internal
-    variability, `model` has dims (member, year). Returns member indices (best first), their
-    score and lag.
+    variability, `model` has dims (member, year). Several indices: `obs` (index, year), `model`
+    (index, member, year) and `weights` (index), scores combined with `combine` (the same lag for all
+    indices of a member). Returns member indices (best first), their score and lag.
     """
+    obs = np.atleast_2d(obs)
+    model = model[None] if model.ndim == 2 else model
+    n_index = obs.shape[0]
+    weights = np.full(n_index, 1 / n_index) if weights is None else np.asarray(weights, dtype=float) / np.sum(weights)
     window = cfg["window"]
-    obs_cut = obs[obs_years <= init]
-    obs_filtered = apply_filter(obs_cut, cfg["filter"])[0]
-    obs_series = np.full(years.shape, np.nan)
-    in_obs = np.isin(years, obs_years[obs_years <= init])
-    obs_series[in_obs] = obs_filtered[np.isin(obs_years[obs_years <= init], years)]
+    known = obs_years <= init
+    obs_series = np.full((n_index, len(years)), np.nan)
+    in_obs = np.isin(years, obs_years[known])
+    for k in range(n_index):
+        obs_filtered = apply_filter(obs[k, known], cfg["filter"])[0]
+        obs_series[k, in_obs] = obs_filtered[np.isin(obs_years[known], years)]
     mask = window_mask(years, init, window) & in_obs
     if window != "all" and mask.sum() < window:
         raise ValueError(f"init {init}: matching window not covered by the observations")
-    # years the filter cannot provide with the requested number of values
-    mask = mask & np.isfinite(obs_series)
-    obs_win = obs_series[mask]
+    # years the filter cannot provide with the requested number of values (for any index)
+    mask = mask & np.isfinite(obs_series).all(axis=0)
+    obs_win = obs_series[:, mask]
 
     selection, measure = cfg["selection"], cfg["measure"]
     first_measure = "CORR" if measure == "two_stage" else measure
-    n_members = model.shape[0]
+    n_members = model.shape[1]
+
+    def joint(lag, measure_, rows=slice(None)):
+        per_index = [member_scores_for_lag(model[k, rows], years, obs_win[k], init, cfg, lag, measure_, mask)[1] for k in range(n_index)]
+        return combine(np.stack(per_index), weights, measure_)
 
     if selection == "subsample":
-        filtered, best = member_scores_for_lag(model, years, obs_win, init, cfg, 0, first_measure, mask)
+        best = joint(0, first_measure)
         best_lag = np.zeros(n_members, dtype=int)
     elif selection in ["shift", "shift_subsample"]:
         lags = np.arange(-cfg["max_lag"], cfg["max_lag"] + 1)
-        all_scores = np.stack([member_scores_for_lag(model, years, obs_win, init, cfg, int(lag), first_measure, mask)[1] for lag in lags])
+        all_scores = np.stack([joint(int(lag), first_measure) for lag in lags])
         filled = np.where(np.isfinite(all_scores), all_scores, np.inf if first_measure == "RMSE" else -np.inf)
         ilag = filled.argmin(axis=0) if first_measure == "RMSE" else filled.argmax(axis=0)
         best = all_scores[ilag, np.arange(n_members)]
@@ -159,10 +180,7 @@ def select_members(obs: np.ndarray, obs_years: np.ndarray, model: np.ndarray, ye
         if measure == "two_stage":
             # keep the best by correlation (phase), then the best of those by RMSE (amplitude)
             order = order[: int(M / cfg["two_stage_fraction"])]
-            amp = np.array([
-                scores(obs_win, member_scores_for_lag(model[[i]], years, obs_win, init, cfg, int(best_lag[i]), "RMSE", mask)[0][:, mask], "RMSE")[0]
-                for i in order
-            ])
+            amp = np.array([joint(int(best_lag[i]), "RMSE", [i])[0] for i in order])
             order = order[rank(amp, "RMSE")][:M]
         else:
             order = order[:M]

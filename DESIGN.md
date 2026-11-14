@@ -123,6 +123,24 @@ predictor or of `obs`: the HadSLP/ERA5 merge (`obs.merge`, null to switch off), 
   `configs/experiments/pdo_from_tas.yaml`, a PDO-like index from tas over the ocean as a test with
   existing data (ERA5: corr. 0.96 with the PDO from ERA5 SST, 1940-2025).
 
+### Several indices
+- `predictor.indices: {name: {overrides}}` defines several indices on the base `predictor` block (e.g.
+  NAO and EA as modes 1 and 2, `configs/experiments/nao_ea.yaml`). `index_cfg(cfg, name)` gives the
+  configuration of one index; patterns, indices, split and index evaluation run per index and hash like a
+  single-index configuration, so an index shared by several configurations is computed once. The first
+  index is the primary one: its split removes the forced part of the targets.
+- Sign of a pattern: positive at `sign_reference_point`, or negative there with `sign: negative` in the
+  point (EA in the CPC convention: `{lat: 55, lon: -20, sign: negative}`, EA+ = low west of the British Isles).
+- Analogues: matched jointly on `analogues.match_weights` (weighted mean of the per-index correlations,
+  or root of the weighted mean of the squared errors for RMSE; one lag per member for all indices). The
+  pool are the members with all needed indices; the hindcast stores every needed index (`index_<name>`).
+  The synthetic null test is only run for matching on a single index.
+- Linear model: `linear_model.predictors`, multiple regression on the window means, optional ridge
+  (`linear_model.ridge`, penalty relative to the predictors' variance). M2b/M3b: mean
+  sum_p slope_p x_p, spread^2 = slope' C slope + sigma^2 with C the covariance of the members' window
+  means.
+- Settings for several indices only enter the hashes when used (`core.io.HASH_NEUTRAL`).
+
 ### Regions and targets
 - `region`: domain of the prediction targets, the active targets and the sites. The CMIP6 fields
   of the targets use `domain: region` (resolved when the config is loaded).

@@ -25,7 +25,7 @@ import numpy as np
 import xarray as xr
 
 from climate_scenarios_2050.core import domain as dom
-from climate_scenarios_2050.core.config import predictor_field
+from climate_scenarios_2050.core.config import index_cfg, index_names, predictor_field
 from climate_scenarios_2050.core.io import StepOutput, write_netcdf
 from climate_scenarios_2050.preprocess import cmip6, masks, obs
 from climate_scenarios_2050.preprocess.indices import box, eof
@@ -36,8 +36,9 @@ IMPLEMENTED = ["eof", "box"]
 PLOT_ONLY = {"predictor": ["reference_skill"]}   # settings that only change figures
 
 
-def index_output(cfg) -> StepOutput:
-    """observed indices and reference pattern"""
+def index_output(cfg, index: str = None) -> StepOutput:
+    """observed indices and reference pattern of one index (default: the primary index)"""
+    cfg = index_cfg(cfg, index)
     pred = cfg["predictor"]
     return StepOutput(
         cfg, "indices", sections=["predictor"],
@@ -47,8 +48,9 @@ def index_output(cfg) -> StepOutput:
     )
 
 
-def cmip6_index_output(cfg, scenario: str) -> StepOutput:
-    """CMIP6 indices of one scenario"""
+def cmip6_index_output(cfg, scenario: str, index: str = None) -> StepOutput:
+    """CMIP6 indices of one scenario and index (default: the primary index)"""
+    cfg = index_cfg(cfg, index)
     pred = cfg["predictor"]
     return StepOutput(
         cfg, "indices_cmip6", sections=["predictor"], extra={"scenario": scenario},
@@ -85,7 +87,7 @@ class IndexCalculator:
         if self.pred["method"] == "eof":
             sign_point = self.pred["sign_reference_point"]
             if sign_point is not None:
-                sign_point = {"lat": sign_point["lat"], "lon": dom.point_lon(sign_point["lon"], self.pred["domain"])}
+                sign_point = {**sign_point, "lon": dom.point_lon(sign_point["lon"], self.pred["domain"])}
             self.reference = eof.fit_pattern(
                 ref_field, self.pred["normal_period"], self.pred["n_modes"], self.pred["detrend_for_fit"],
                 sign_point, source=self.ref_name,
@@ -133,6 +135,13 @@ def merge_indices(early: xr.DataArray, late: xr.DataArray, merge_cfg: dict) -> x
 
 
 def run(cfg, scenarios=None):
+    """all configured indices"""
+    for name in index_names(cfg):
+        log.info(f"index {name}")
+        run_index(index_cfg(cfg, name), scenarios)
+
+
+def run_index(cfg, scenarios=None):
     pred = cfg["predictor"]
     out = index_output(cfg).prepare()
     log.info(f"indices -> {out.dir}")
@@ -186,13 +195,13 @@ def obs_index_names(cfg) -> list:
     return [*cfg["predictor"]["obs_datasets"], *(["merged"] if cfg["obs"].get("merge") else [])]
 
 
-def open_obs_index(cfg, dataset: str) -> xr.DataArray:
-    out = index_output(cfg)
+def open_obs_index(cfg, dataset: str, index: str = None) -> xr.DataArray:
+    out = index_output(cfg, index)
     with xr.open_dataset(out.path(f"obs_{dataset}.nc")) as ds:
         return ds["index"].load()
 
 
-def open_cmip6_index(cfg, scenario: str) -> xr.DataArray:
-    out = cmip6_index_output(cfg, scenario)
+def open_cmip6_index(cfg, scenario: str, index: str = None) -> xr.DataArray:
+    out = cmip6_index_output(cfg, scenario, index)
     with xr.open_dataset(out.path(f"cmip6_{scenario}.nc")) as ds:
         return ds["index"].load()

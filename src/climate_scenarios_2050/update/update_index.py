@@ -19,7 +19,7 @@ import numpy as np
 import xarray as xr
 
 from climate_scenarios_2050.core import domain as dom
-from climate_scenarios_2050.core.config import predictor_field
+from climate_scenarios_2050.core.config import index_cfg, index_names, predictor_field
 from climate_scenarios_2050.core.io import write_netcdf
 from climate_scenarios_2050.core.timeconv import seasonal_mean
 from climate_scenarios_2050.preprocess import masks, obs
@@ -72,6 +72,15 @@ def _replace(cfg, path, updated: xr.Dataset, last_old: int):
 
 
 def run(cfg, files=None):
+    """every configured index"""
+    added = {}
+    for name in index_names(cfg):
+        log.info(f"update of index {name}")
+        added[name] = run_index(index_cfg(cfg, name), files)
+    return added
+
+
+def run_index(cfg, files=None):
     out = index_output(cfg)
     tolerance = cfg["update"]["tolerance"]
     with xr.open_dataset(out.path("obs_ERA5.nc")) as ds:

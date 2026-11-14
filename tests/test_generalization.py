@@ -75,6 +75,8 @@ def test_eof_with_land_and_global_mean():
     index = eof.project(anom, pattern, 1, eof.normal_period_climatology(anom, normal))
     assert index.notnull().all()
     assert np.corrcoef(index.values, signal)[0, 1] > 0.95             # positive by the sign point
+    flipped = eof.fit_pattern(anom, normal, n_modes=3, detrend_fit=True, sign_point={"lat": 45.0, "lon": 230.0, "sign": "negative"})
+    np.testing.assert_allclose(flipped["components"].sel(mode=1), -pattern["components"].sel(mode=1))
 
     # an ensemble: land does not discard member-years, and the climatology uses the full members
     ens, gm_ens, signal_ens = pdo_like(rng, members=3)

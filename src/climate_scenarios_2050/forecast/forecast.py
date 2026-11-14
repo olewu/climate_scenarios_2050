@@ -21,9 +21,11 @@ If a window lies inside the record, the observed change is added (`observed`).
 
 Member values are stored per scenario in `members_init<year>[_ref<year>]_<scenario>.nc` (distributions
 of the site figure): the predictor window mean of every member (`x_all`, with weights) and of the
-analogue members (`x_analogue`), slope and residual spread of the linear model in the units of the
-change (`slope_u`, `sigma_u`), and the CMIP6 change of every member on the CMIP6 grid (`sfc_change`). M2b/M3b are
-then the mixture of N(mean + slope_u (x_m - weighted mean of x), sigma_u) over the members.
+analogue members (`x_analogue`), (member, predictor), slopes and residual spread of the linear model
+in the units of the change (`slope_u` (predictor, ...), `sigma_u`), and the CMIP6 change of every member on the CMIP6 grid (`sfc_change`). M2b/M3b are
+then the mixture of N(mean + slope_u . (x_m - weighted mean of x), sigma_u) over the members. With several
+indices (`predictor.indices`) the analogues are matched jointly (`analogues.match_weights`) and the linear
+model has several predictors (`linear_model.predictors`).
 """
 
 import logging
@@ -36,12 +38,12 @@ import xarray as xr
 from climate_scenarios_2050.analogues import matching
 from climate_scenarios_2050.analogues.preselection import selected_models
 from climate_scenarios_2050.core import domain as dom
-from climate_scenarios_2050.core.config import select, target_spec
+from climate_scenarios_2050.core.config import hindcast_indices, lm_predictors, match_weights, primary_index, select, target_spec
 from climate_scenarios_2050.core.io import StepOutput, write_netcdf
 from climate_scenarios_2050.core.timeconv import window_label
 from climate_scenarios_2050.evaluate.target import to_target_grid
 from climate_scenarios_2050.linear_model.fit import Training, fit_case, sliding_means
-from climate_scenarios_2050.methods.target import CMIP6_AGGREGATION, cmip6_mmem, member_change, member_weights, mmem_change, open_cmip6_target, weighted_mean_std
+from climate_scenarios_2050.methods.target import CMIP6_AGGREGATION, cmip6_mmem, member_change, member_weights, mmem_change, open_cmip6_target, weighted_mean_cov, weighted_mean_std
 from climate_scenarios_2050.preprocess import cmip6, obs
 from climate_scenarios_2050.preprocess.indices.compute import index_output, open_obs_index
 from climate_scenarios_2050.split import forced as fc
@@ -53,6 +55,10 @@ log = logging.getLogger(__name__)
 def forecast_output(cfg, scenarios, target_variable, windows) -> StepOutput:
     spec = target_spec(cfg, target_variable)
     upstream = {"indices": index_output(cfg).hash, "split": {s: split_output(cfg, s).hash for s in scenarios}, "obs_target": obs.target_output(cfg, target_variable).hash}
+    names = hindcast_indices(cfg)
+    if names != [primary_index(cfg)]:
+        upstream["indices"] = {n: index_output(cfg, n).hash for n in names}
+        upstream["split"] = {s: {n: split_output(cfg, s, n).hash for n in names} for s in scenarios}
     if spec.get("cmip6"):
         upstream["cmip6_fields"] = {s: cmip6.field_id(cfg, spec["cmip6"], CMIP6_AGGREGATION, s) for s in scenarios}
     return StepOutput(
@@ -70,16 +76,47 @@ def internal_up_to_init(series: xr.DataArray, basis: xr.DataArray, init: int, mi
     return series - fc.forced_part(design, coef), coef
 
 
-def analogue_selection(cfg, split, internal: xr.DataArray, init: int):
-    """selected members (indices into `internal`) and their lags at the init year"""
-    series = open_obs_index(cfg, cfg["obs"]["matching_index"]).dropna("year")
-    obs_internal, _ = internal_up_to_init(series, split.basis, init, cfg["split"]["min_fit_years"])
-    pool = internal
+def member_pool(cfg, scenario: str):
+    """
+    internal CMIP6 series (index, member, year) of the indices in `hindcast_indices` (primary, matched,
+    predictors) for the members that have all of them, the primary index's internal series, and the splits
+    """
+    names = hindcast_indices(cfg)
+    splits = {n: SplitResults(cfg, scenario, n) for n in names}
+    internals = {n: s.cmip6_internal().transpose("member", "year") for n, s in splits.items()}
+    common = sorted(set.intersection(*[set(i.member.values.astype(str)) for i in internals.values()]))
+    first = internals[names[0]].sel(member=common)
+    stack = np.stack([internals[n].sel(member=common).reindex(year=first.year).values for n in names])
+    return names, stack, first, splits
+
+
+def analogue_selection(cfg, names, stack, first, splits, init: int):
+    """selected members (names) and their lags at the init year, matched jointly on `analogues.match_weights`"""
+    weights = match_weights(cfg)
+    matched = list(weights)
+    min_fit = cfg["split"]["min_fit_years"]
+    obs_internal = {}
+    for n in matched:
+        series = open_obs_index(cfg, cfg["obs"]["matching_index"], n).dropna("year")
+        obs_internal[n], _ = internal_up_to_init(series, splits[n].basis, init, min_fit)
+    obs_years = obs_internal[matched[0]].year.values
+    for n in matched[1:]:
+        obs_years = np.intersect1d(obs_years, obs_internal[n].year.values)
+    rows = np.ones(first.sizes["member"], dtype=bool)
     if cfg["analogues"]["preselection"] is not None:
-        models = selected_models(cfg["analogues"]["preselection"], internal["model"].values, internal, obs_internal, cfg["paths"]["inputs"]["subsampling"])
-        pool = internal.isel(member=np.isin(internal["model"].values, models))
-    sel = matching.select_members(obs_internal.values, series.year.values, pool.values, pool.year.values, init, cfg["analogues"])
-    return pool.member.values[sel["member"]].astype(str), sel["lag"], sel
+        primary = primary_index(cfg)
+        models = selected_models(cfg["analogues"]["preselection"], first["model"].values, first, obs_internal.get(primary), cfg["paths"]["inputs"]["subsampling"])
+        rows = np.isin(first["model"].values, models)
+    model = np.stack([stack[names.index(n)][rows] for n in matched])
+    obs_values = np.stack([obs_internal[n].sel(year=obs_years).values for n in matched])
+    sel = matching.select_members(obs_values, obs_years, model, first.year.values, init, cfg["analogues"], np.array([weights[n] for n in matched]))
+    return first.member.values[rows][sel["member"]].astype(str), sel["lag"], sel
+
+
+def quadratic(slope: xr.DataArray, cov: xr.DataArray) -> xr.DataArray:
+    """slope' C slope over the predictors (slope: predictor, ...; cov: predictor, predictor2)"""
+    cov = cov.assign_coords(predictor=slope.predictor.values, predictor2=slope.predictor.values)
+    return (slope * (cov * slope.rename(predictor="predictor2")).sum("predictor2")).sum("predictor")
 
 
 def past_change_spread(wind: xr.DataArray, window, reference_length: int, init: int, gap: int = 0) -> xr.DataArray:
@@ -118,20 +155,25 @@ def forecast_scenario(cfg, scenario, target_variable, init, windows, reference_e
     wind_ref = wind.isel(year=in_ref.values).mean("year")
     to_units = 100 / wind_ref.where(wind_ref > 0) if relative else xr.ones_like(wind_ref)
 
-    # members
-    internal = split.cmip6_internal().transpose("member", "year")
-    weights = member_weights(internal["model_id"].values, cfg["cmip6"]["weighting"])
-    selected, lags, sel = analogue_selection(cfg, split, internal, init)
+    # members: pool of all members with every needed index, analogues matched jointly
+    names, stack, first, splits = member_pool(cfg, scenario)
+    weights = member_weights(first["model_id"].values, cfg["cmip6"]["weighting"])
+    selected, lags, sel = analogue_selection(cfg, names, stack, first, splits, init)
     log.info(f"{scenario}: {len(selected)} analogue members of {sel['n_valid']} valid, best score {sel['score'][0]:.2f}")
-    at_selected = internal.sel(member=list(selected))
+    predictors = lm_predictors(cfg)
+    member_rows = {m: i for i, m in enumerate(first.member.values.astype(str))}
+    selected_rows = np.array([member_rows[m] for m in selected], dtype=int)
+    pred_stack = np.stack([stack[names.index(n)] for n in predictors])          # (predictor, member, year)
+    member_years = first.year.values
 
-    # training data: internal index and wind up to init
+    # training data: internal indices and target up to init
     training = Training(cfg, scenario, target_variable)
-    index = open_obs_index(cfg, training.index_name).dropna("year")
-    index_internal, _ = internal_up_to_init(index, split.basis, init, min_fit)
     wind_internal, wind_coef = internal_up_to_init(wind, split.basis, init, min_fit, lag=lag)
     pair = training.years[training.years <= reference_end]
-    x_train = index_internal.sel(year=pair - lag).values
+    x_train = np.stack([
+        internal_up_to_init(open_obs_index(cfg, training.index_name, n).dropna("year"), splits[n].basis, init, min_fit)[0].sel(year=pair - lag).values
+        for n in predictors
+    ], axis=1)
     y_train = wind_internal.sel(year=pair).transpose("year", ...).values.reshape(len(pair), -1)
     internal_ref = wind_internal.isel(year=in_ref.values).mean("year")
 
@@ -147,19 +189,24 @@ def forecast_scenario(cfg, scenario, target_variable, init, windows, reference_e
     for window, label in zip(windows, labels):
         a, b = window
         length = b - a + 1
-        slope, intercept, sigma, n = fit_case(x_train, y_train, length, None, cfg["linear_model"]["min_samples"])
+        slope, intercept, sigma, n = fit_case(x_train, y_train, length, None, cfg["linear_model"]["min_samples"], float(cfg["linear_model"].get("ridge") or 0.0))
         reshape = lambda v: xr.DataArray(v.reshape(wind_ref.shape), dims=wind_ref.dims, coords=wind_ref.coords)
-        slope, intercept, sigma = reshape(slope), reshape(intercept), reshape(sigma)
+        slope = xr.DataArray(slope.reshape(len(predictors), *wind_ref.shape), dims=("predictor", *wind_ref.dims), coords={"predictor": predictors, **wind_ref.coords})
+        intercept, sigma = reshape(intercept), reshape(sigma)
 
         leads = np.arange(a - lag, b - lag + 1)
-        def predictor(members, member_lags=None):
-            values = matching.align_leads(members.values, members.year.values, init, leads, member_lags)
-            return np.where(np.isfinite(values).all(axis=1), values.mean(axis=1), np.nan)
-        x_all, x_ana = predictor(internal), predictor(at_selected, lags)
-        all_mean, all_std = weighted_mean_std(x_all, weights)
-        ana_mean, ana_std = weighted_mean_std(x_ana, np.full(len(selected), 1 / len(selected)))
+        def predictor_means(rows=slice(None), member_lags=None):
+            """window means (member, predictor)"""
+            out = []
+            for k in range(len(predictors)):
+                values = matching.align_leads(pred_stack[k][rows], member_years, init, leads, member_lags)
+                out.append(np.where(np.isfinite(values).all(axis=1), values.mean(axis=1), np.nan))
+            return np.stack(out, axis=1)
+        x_all, x_ana = predictor_means(), predictor_means(selected_rows, lags)
+        all_mean, all_cov = weighted_mean_cov(x_all, weights)
+        ana_mean, ana_cov = weighted_mean_cov(x_ana, np.full(len(selected), 1 / len(selected)))
         members = xr.Dataset({
-            "x_all": ("member", x_all), "x_analogue": ("analogue", x_ana),
+            "x_all": (("member", "predictor"), x_all), "x_analogue": (("analogue", "predictor"), x_ana),
             "slope_u": (slope * to_units).astype("float32"), "sigma_u": (sigma * to_units).astype("float32"),
         })
 
@@ -172,15 +219,19 @@ def forecast_scenario(cfg, scenario, target_variable, init, windows, reference_e
             forced = forced_index
 
         internal_m0 = -internal_ref * to_units
-        # M0 has no predictor: spread of the training window means around their mean
+        # M0 has no predictor: spread of the predicted training window means around their mean
         x_windows = sliding_means(x_train, length)
-        spread_m0 = np.sqrt(sigma**2 + (slope * np.nanstd(x_windows)) ** 2) * to_units
+        x_windows = x_windows[np.isfinite(x_windows).all(axis=1)]
+        explained_var = xr.DataArray(np.cov(x_windows.T, bias=True).reshape(len(predictors), len(predictors)), dims=("predictor", "predictor2"))
+        spread_m0 = np.sqrt(sigma**2 + quadratic(slope, explained_var)) * to_units
         methods = {"M0": (internal_m0, spread_m0, internal_m0)}
         spread_m1 = past_change_spread(wind, window, ref_len, init, gap) * to_units
         methods["M1"] = (xr.zeros_like(wind_ref), spread_m1, None)
-        for name, x_mean, x_std in [("M2b", all_mean, all_std), ("M3b", ana_mean, ana_std)]:
-            part = (slope * x_mean + intercept - internal_ref) * to_units
-            methods[name] = (part, np.sqrt((slope * x_std) ** 2 + sigma**2) * to_units, part)
+        for name, x_mean, x_cov in [("M2b", all_mean, all_cov), ("M3b", ana_mean, ana_cov)]:
+            x_mean = xr.DataArray(x_mean, dims="predictor", coords={"predictor": predictors})
+            x_cov = xr.DataArray(x_cov, dims=("predictor", "predictor2"))
+            part = ((slope * x_mean).sum("predictor") + intercept - internal_ref) * to_units
+            methods[name] = (part, np.sqrt(quadratic(slope, x_cov) + sigma**2) * to_units, part)
         if field is not None:
             position = {m: i for i, m in enumerate(field.member.values.astype(str))}
             found = [m in position for m in selected]
@@ -217,7 +268,7 @@ def forecast_scenario(cfg, scenario, target_variable, init, windows, reference_e
     result.attrs.update({"init_year": init, "target_variable": target_variable, "units": "%" if relative else wind.attrs.get("units", "units of the target"), "reference_period": f"{reference_end - ref_len + 1}-{reference_end}", "n_analogues": len(selected)})
 
     members = xr.concat(member_parts, dim="window")
-    members = members.assign_coords(member=internal.member.values.astype(str), analogue=np.asarray(selected).astype(str))
+    members = members.assign_coords(member=first.member.values.astype(str), analogue=np.asarray(selected).astype(str), predictor=predictors)
     members["weight_all"] = ("member", weights)
     members["analogue_lag"] = ("analogue", np.asarray(lags))
     if field is not None:
@@ -251,12 +302,13 @@ def site_components(point: xr.Dataset, members, name: str, reference_value: floa
     site = {"latitude": float(point.latitude), "longitude": float(point.longitude)}
     if name in ("M2b", "M3b"):
         x = members["x_all" if name == "M2b" else "x_analogue"].values
+        x = x[:, None] if x.ndim == 1 else x                                  # (member, predictor)
         w = members["weight_all"].values if name == "M2b" else np.ones(len(x))
-        ok = np.isfinite(x)
+        ok = np.isfinite(x).all(axis=1)
         x, w = x[ok], w[ok] / w[ok].sum()
-        slope = float(members["slope_u"].sel(site, method="nearest"))
+        slope = np.atleast_1d(members["slope_u"].sel(site, method="nearest").values)
         sigma = float(members["sigma_u"].sel(site, method="nearest"))
-        return mean + slope * (x - (w * x).sum()), np.full(len(x), sigma), w
+        return mean + (x - w @ x) @ slope, np.full(len(x), sigma), w
     if name in ("M2a", "M3a") and "sfc_change" in members:
         var = "sfc_change" if name == "M2a" else "sfc_change_analogue"
         values = members[var].interp(lat=site["latitude"], lon=site["longitude"]).values

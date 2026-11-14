@@ -9,7 +9,8 @@ Pattern
 -------
 Fitted on one dataset over the normal period: anomalies with respect to the normal-period
 mean, optionally linearly detrended (as before), sqrt(cos(lat))-weighted EOFs (xeofs).
-The sign of each mode is fixed so that the pattern is positive at `sign_reference_point`.
+The sign of each mode is fixed so that the pattern is positive at `sign_reference_point` (negative with
+`sign: negative` in the point).
 Stored: unit-norm components V (in weighted space), the fit-sample score mean/std
 (standardization), explained variance ratio.
 
@@ -88,6 +89,8 @@ def fit_pattern(field: xr.DataArray, normal_period, n_modes: int = 10, detrend_f
     if sign_point is not None:
         sign = np.sign(comps.sel(lat=sign_point["lat"], lon=sign_point["lon"], method="nearest"))
         sign = sign.where(sign != 0, 1)
+        if sign_point.get("sign", "positive") == "negative":
+            sign = -sign
         comps = comps * sign
         scores = scores * sign
 

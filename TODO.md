@@ -37,9 +37,14 @@ Checked items stay in the list until they are removed after agreement. `(you)` =
   the split into `hindcast-target` (per target), so a tas download no longer changes the index steps
 
 ## 3. Several indices
-- [ ] multi-linear model (e.g. NAO + EA), optional ridge shrinkage; NAO-only stays the default
-- [ ] joint analogue matching on several indices (weighted mean of the scores, new parameter)
-- [ ] index evaluation for every index in the hindcast
+- [x] multi-linear model (e.g. NAO + EA), optional ridge shrinkage; NAO-only stays the default
+- [x] joint analogue matching on several indices (`analogues.match_weights`, weighted mean of the scores)
+- [x] index evaluation for every index in the hindcast
+- [x] `predictor.indices` (per-index views; single-index hashes unchanged), example `configs/experiments/nao_ea.yaml`
+- [ ] (you) first NAO + EA run after the download (`--config configs/experiments/nao_ea.yaml`); only the observed side is
+  checked on real data so far (NAO 48 %, EA 15 % of the ERA5 DJFM SLP variance)
+- [x] **decision**: sign of the EA - CPC convention (EA+ = low pressure west of the British Isles) via
+  `sign_reference_point: {lat: 55, lon: -20, sign: negative}`
 
 ## 4. Other regions and predictors (code in place, data later)
 - [x] rename `nao` -> `index` steps/modules (`hindcast-index`, `evaluate-index`, `perfect_index`, `forced_target`)
@@ -54,7 +59,7 @@ Checked items stay in the list until they are removed after agreement. `(you)` =
 - [ ] first real PDO run with tos: check the regridding of curvilinear ocean grids (only tested on synthetic data)
 
 ## Smaller points
-- [x] commit the current work on `restructure_project` (586f930)
+- [x] commit the current work on `restructure_project` (586f930, 7771663)
 - [ ] index files carry the psl attributes (`units: Pa`)
 - [ ] `obs_target` hash uses the input path, not the content (declined for now)
 - [ ] plain `pytest` fails on the `--cov` options in `setup.cfg` (`pixi run test` works)

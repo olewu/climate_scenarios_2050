@@ -7,9 +7,9 @@ absolute as the target's `change`. All predictions are Gaussian (mean, spread):
   perfect_index  the linear model given the observed index in the target window (upper limit, not a forecast)
   M1    persistence: no change, spread of the observed changes (non-overlapping samples)
   M2a/M3a  change of the target's CMIP6 variable (e.g. sfcWind for wsp100) in all/analogue members
-  M2b/M3b  linear model on the index of all/analogue members:
-           internal change = slope * x + intercept - observed internal reference,
-           spread^2 = slope^2 * var(x) + sigma^2, x = predictor window mean of the members
+  M2b/M3b  linear model on the index (indices) of all/analogue members:
+           internal change = sum_p slope_p x_p + intercept - observed internal reference,
+           spread^2 = slope' C slope + sigma^2, x = predictor window means of the members, C their covariance
 Targets:
   full      observed change. M2b/M3b add the forced part: `a` (regression on the index MMEM, the
             default) and, with a CMIP6 variable, `b` (change of its CMIP6 MMEM; suffix _b)
@@ -119,18 +119,21 @@ def build_predictions(cfg, scenario, target_variable):
     forced_a = index_forced_change(split, target_variable, wind.year.values, inits, windows, ref_len) * to_units
 
     methods = {"full": {}, "internal": {}}
+    slope = params["slope"]
     for ensemble, name in [("all", "M2b"), ("analogue", "M3b")]:
         x_mean = index["mean"].sel(ensemble=ensemble, drop=True)
-        x_std = index["std"].sel(ensemble=ensemble, drop=True)
-        internal = (params["slope"] * x_mean + params["intercept"] - params["obs_reference"]) * to_units
-        spread = np.sqrt((params["slope"] * x_std) ** 2 + params["sigma"] ** 2) * to_units
+        cov = index["cov"].sel(ensemble=ensemble, drop=True)
+        internal = ((slope * x_mean).sum("predictor", skipna=False) + params["intercept"] - params["obs_reference"]) * to_units
+        # spread^2 = slope' C slope + sigma^2, C: covariance of the members' predictor window means
+        explained = (slope * (cov * slope.rename(predictor="predictor2")).sum("predictor2", skipna=False)).sum("predictor", skipna=False)
+        spread = np.sqrt(explained + params["sigma"] ** 2) * to_units
         methods["internal"][name] = (internal, spread)
         methods["full"][name] = (internal + forced_a, spread)
 
     # references for the value of the index: reversion to the long-term mean without any index information
     # (the internal part has zero mean over the fitting years), and the observed index in the target window
     reversion = -params["obs_reference"] * to_units
-    perfect = (params["slope"] * params["index_window"] + params["intercept"] - params["obs_reference"]) * to_units
+    perfect = ((slope * params["index_window"]).sum("predictor", skipna=False) + params["intercept"] - params["obs_reference"]) * to_units
     methods["internal"]["M0"] = (reversion, params["sigma"] * to_units)
     methods["full"]["M0"] = (reversion + forced_a, params["sigma"] * to_units)
     methods["internal"]["perfect_index"] = (perfect, params["sigma"] * to_units)
