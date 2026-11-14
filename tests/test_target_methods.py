@@ -1,8 +1,8 @@
 import numpy as np
 import xarray as xr
 
-from climate_scenarios_2050.evaluate import wind as ev
-from climate_scenarios_2050.methods.wind import member_weights, sfcwind_change, weighted_mean_std
+from climate_scenarios_2050.evaluate import target as ev
+from climate_scenarios_2050.methods.target import member_weights, member_change, weighted_mean_std
 
 
 def test_member_weights_model_counts_once():
@@ -17,19 +17,21 @@ def test_weighted_mean_std_ignores_missing_members():
     assert mean == 2 and std == 1
 
 
-def test_sfcwind_change_own_reference():
+def test_member_change_own_reference():
     years = np.arange(1900, 2000)
     # member 0 constant, member 1 doubled in the window
     values = np.ones((2, 100, 1, 1))
     values[1, (years >= 1951) & (years <= 1955)] = 2
-    out = sfcwind_change(values, years, 1950, (1, 5), 20)
+    out = member_change(values, years, 1950, (1, 5), 20)
     assert out[0, 0, 0] == 0 and out[1, 0, 0] == 100
     # lag: member years shifted by 3
-    assert sfcwind_change(values, years, 1947, (1, 5), 20, np.array([0, 3]))[1, 0, 0] == 100
+    assert member_change(values, years, 1947, (1, 5), 20, np.array([0, 3]))[1, 0, 0] == 100
     # reference ending before init: years 1931-1950 for init 1951 (window 1952-1956 not doubled)
-    assert sfcwind_change(values, years, 1950, (1, 5), 20, reference_end=1949)[1, 0, 0] == 100
+    assert member_change(values, years, 1950, (1, 5), 20, reference_end=1949)[1, 0, 0] == 100
     # window not covered
-    assert np.isnan(sfcwind_change(values, years, 1995, (1, 10), 20)).all()
+    assert np.isnan(member_change(values, years, 1995, (1, 10), 20)).all()
+    # absolute change: doubled values minus reference
+    assert member_change(values, years, 1950, (1, 5), 20, relative=False)[1, 0, 0] == 1.0
 
 
 def _case():

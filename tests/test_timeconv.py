@@ -97,6 +97,17 @@ def fake_archive(tmp_path, models, scenario="ssp370"):
     }
 
 
+def test_short_scenario_runs_left_out(tmp_path):
+    from climate_scenarios_2050.preprocess import cmip6
+
+    fake_archive(tmp_path, {"A": ["r1i1p1f1", "r2i1p1f1"]})
+    short = tmp_path / "archive" / "ssp370" / "A" / "psl" / "psl_Amon_A_ssp370_r2i1p1f1_gn_201501-210012.nc"
+    short.rename(short.with_name("psl_Amon_A_ssp370_r2i1p1f1_gn_201501-202012.nc"))
+    found = cmip6.discover_members(tmp_path / "archive", "psl", "ssp370", min_scenario_end=2099)
+    assert list(found["A"]) == ["r1i1p1f1"]
+    assert list(cmip6.discover_members(tmp_path / "archive", "psl", "ssp370")["A"]) == ["r1i1p1f1", "r2i1p1f1"]
+
+
 def test_member_list_enters_hash(tmp_path):
     from climate_scenarios_2050.preprocess import cmip6
 

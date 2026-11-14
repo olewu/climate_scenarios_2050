@@ -9,7 +9,15 @@ For every model and member with both a historical and a scenario run:
 3. seasonal/annual means are computed on the native grid (month lengths of the model's own
    calendar, only complete seasons), restricted to the target domain plus a margin
 4. the means are regridded (xesmf, weights cached per source grid) to the regular global grid,
-   cut to the target domain
+   cut to the target domain (domains crossing the date line on longitudes 0 ... 360, see `core.domain`)
+5. optionally (`global_mean: true`, or `ocean` for the ocean points only, mask from ERA5 SST) the
+   area-weighted (cos lat) global mean of the native field is stored as `<variable>_global_mean`
+   (member, year), e.g. to remove it from SST before the PDO EOF
+
+Fields are entries of `preprocess.fields`, named after their CMIP6 variable unless `variable` is given
+(e.g. `tas_np: {variable: tas, ...}`: North Pacific tas next to the regional tas of a target).
+
+The CMIP6 table of a variable is `Amon` unless set in `cmip6.tables` (e.g. tos: Omon).
 
 Output: one zarr per model, `<cmip6_processed>/<variable>_<aggregation>/<hash>/<scenario>/<model>.zarr`
 with dims (member, year, lat, lon); member names `<model id><variant>` (ids from configs/model_ids.yaml).
@@ -26,7 +34,8 @@ import xarray as xr
 import xesmf as xe
 from joblib import Parallel, delayed
 
-from climate_scenarios_2050.core.config import config_hash, load_model_ids
+from climate_scenarios_2050.core import domain as dom
+from climate_scenarios_2050.core.config import cmip6_table, config_hash, field_variable, load_model_ids, used_fields
 from climate_scenarios_2050.core.io import ensure_writable, write_yaml
 from climate_scenarios_2050.core.timeconv import seasonal_mean
 
@@ -36,16 +45,20 @@ VARIANT_PATTERN = re.compile(r"_(r\d+i\d+p\d+f\d+)_")
 HIST_END = 2014
 DOMAIN_MARGIN = 5.0  # degrees added around the target domain before regridding
 GRID_TOLERANCE = 0.01  # degrees, largest accepted coordinate difference between files of a member
+ZERO_ALLOWED = {"pr", "tos"}  # variables where exact zeros are physical (otherwise a sign of unmapped cells)
 
 
 #---------------grids--------------#
 def target_grid(spacing: float, domain: dict = None) -> xr.Dataset:
-    """regular global grid with cell centres at +-spacing/2 (lon -180 ... 180), optionally cut to a domain"""
+    """
+    regular global grid with cell centres at +-spacing/2 (lon -180 ... 180), optionally cut to a domain
+    (a domain crossing the date line gets longitudes 0 ... 360)
+    """
     lat = np.arange(-90 + spacing / 2, 90, spacing)
     lon = np.arange(-180 + spacing / 2, 180, spacing)
     grid = xr.Dataset(coords={"lat": ("lat", lat), "lon": ("lon", lon)})
     if domain is not None:
-        grid = grid.sel(lat=slice(*domain["lat"]), lon=slice(*domain["lon"]))
+        grid = dom.select(grid, domain)
     grid["lat"].attrs = {"units": "degrees_north", "standard_name": "latitude"}
     grid["lon"].attrs = {"units": "degrees_east", "standard_name": "longitude"}
     return grid
@@ -82,24 +95,42 @@ def standardize_coords(ds: xr.Dataset) -> xr.Dataset:
 
 
 def cut_native(ds: xr.Dataset, domain: dict, margin: float = DOMAIN_MARGIN) -> xr.Dataset:
-    """restrict a (1D) native grid to the domain plus a margin"""
-    lat0, lat1 = domain["lat"][0] - margin, domain["lat"][1] + margin
-    lon0, lon1 = domain["lon"][0] - margin, domain["lon"][1] + margin
-    if ds["lon"].ndim == 1:
-        return ds.sel(lat=slice(lat0, lat1), lon=slice(lon0, lon1))
-    mask = (ds["lat"] >= lat0) & (ds["lat"] <= lat1) & (ds["lon"] >= lon0) & (ds["lon"] <= lon1)
-    return ds.where(mask.compute(), drop=True)
+    """restrict a native grid (1D or curvilinear) to the domain plus a margin, in the domain's longitude convention"""
+    return dom.select(ds, domain, margin)
+
+
+def global_mean(da: xr.DataArray, mask: xr.DataArray = None) -> xr.DataArray:
+    """
+    area-weighted (cos lat) mean over all non-time dimensions of a native field, ignoring missing values;
+    `mask` (True = use, on the field's grid) restricts it, e.g. to the ocean
+    """
+    space = [d for d in da.dims if d != "time"]
+    weights = np.cos(np.deg2rad(da["lat"])).fillna(0).clip(min=0)
+    if weights.ndim == 1 and da["lat"].dims[0] in da.dims:
+        weights = weights.broadcast_like(da.isel(time=0, drop=True))
+    if mask is not None:
+        weights = weights * mask.astype(float).values
+    return da.weighted(weights).mean(space)
+
+
+def global_mean_mask(cfg, kind, da: xr.DataArray):
+    """mask for `global_mean` (None: all points) on the grid of `da`"""
+    if kind in (None, False, True):
+        return None
+    from climate_scenarios_2050.preprocess import masks
+
+    return masks.on_grid(masks.ocean_mask(cfg), da["lat"], da["lon"]).transpose(*[d for d in da.dims if d != "time"])
 
 
 #---------------file discovery--------------#
 @functools.lru_cache(maxsize=None)
-def _discover_cached(cmip6_root: str, variable: str, scenario: str) -> dict:
-    return discover_members(cmip6_root, variable, scenario)
+def _discover_cached(cmip6_root: str, variable: str, scenario: str, min_scenario_end, table="Amon") -> dict:
+    return discover_members(cmip6_root, variable, scenario, min_scenario_end, table)
 
 
 def members(cfg, variable: str, scenario: str) -> dict:
-    """members in the archive with historical and scenario files (scanned once per process)"""
-    return _discover_cached(str(cfg["paths"]["inputs"]["cmip6"]), variable, scenario)
+    """members in the archive with historical and (long enough) scenario files (scanned once per process)"""
+    return _discover_cached(str(cfg["paths"]["inputs"]["cmip6"]), variable, scenario, cfg["cmip6"].get("min_scenario_end"), cmip6_table(cfg, variable))
 
 
 def model_key(variants: dict) -> str:
@@ -112,25 +143,29 @@ def members_hash(cfg, variable: str, scenario: str) -> str:
     return config_hash({model: model_key(variants) for model, variants in members(cfg, variable, scenario).items()})
 
 
-def field_id(cfg, variable: str, aggregation: str, scenario: str) -> str:
+def field_id(cfg, field: str, aggregation: str, scenario: str) -> str:
     """identifies the preprocessed field of a scenario (settings + archive state) for downstream hashes"""
-    store, _ = field_store(cfg, variable, aggregation)
-    return f"{store.name}-{members_hash(cfg, variable, scenario)}"
+    store, _ = field_store(cfg, field, aggregation)
+    return f"{store.name}-{members_hash(cfg, field_variable(cfg, field), scenario)}"
 
 
 def model_store(store: Path, scenario: str, model: str, variants: dict) -> Path:
     return store / scenario / f"{model}_{model_key(variants)}.zarr"
 
 
-def discover_members(cmip6_root, variable: str, scenario: str) -> dict:
+END_PATTERN = re.compile(r"_\d{6}-(\d{4})\d{2}\.nc$")
+
+
+def discover_members(cmip6_root, variable: str, scenario: str, min_scenario_end=None, table: str = "Amon") -> dict:
     """
     {model: {variant: {"historical": [files], scenario: [files]}}} for all members with
-    both historical and scenario files
+    both historical and scenario files; members whose scenario run ends before `min_scenario_end`
+    (by the file names, e.g. CNRM-CM6-1 ssp245 r7-r10 ending 2020) are left out
     """
     cmip6_root = Path(cmip6_root)
     found = {}
     for exp in ["historical", scenario]:
-        for fl in sorted(cmip6_root.glob(f"{exp}/*/{variable}/{variable}_Amon_*_{exp}_*.nc")):
+        for fl in sorted(cmip6_root.glob(f"{exp}/*/{variable}/{variable}_{table}_*_{exp}_*.nc")):
             if fl.stat().st_size == 0:
                 continue
             model = fl.parent.parent.name
@@ -138,11 +173,19 @@ def discover_members(cmip6_root, variable: str, scenario: str) -> dict:
             if match is None:
                 continue
             found.setdefault(model, {}).setdefault(match.group(1), {}).setdefault(exp, []).append(fl)
-    members = {}
+    members, short = {}, []
     for model, variants in found.items():
         both = {var: files for var, files in variants.items() if "historical" in files and scenario in files}
+        if min_scenario_end:
+            for var in list(both):
+                ends = [int(m.group(1)) for m in (END_PATTERN.search(Path(f).name) for f in both[var][scenario]) if m]
+                if ends and max(ends) < min_scenario_end:
+                    short.append(f"{model} {var} (to {max(ends)})")
+                    del both[var]
         if both:
             members[model] = dict(sorted(both.items()))
+    if short:
+        log.info(f"{variable} {scenario}: {len(short)} members left out, scenario run ends before {min_scenario_end}: {', '.join(short)}")
     return dict(sorted(members.items()))
 
 
@@ -158,11 +201,11 @@ def _join_time(parts):
     return xr.concat(parts, dim="time", data_vars="minimal", coords="minimal", compat="override", join="override")
 
 
-def _open_runs(files, variable, years):
+def _open_runs(files, variable, years, chunks=None):
     """open and join the files of one experiment, restricted to calendar years `years` (inclusive)"""
     parts = []
     for fl in files:
-        ds = xr.open_dataset(fl, use_cftime=True, decode_timedelta=False)
+        ds = xr.open_dataset(fl, use_cftime=True, decode_timedelta=False, chunks=chunks)
         # FGOALS/EC-Earth3-Veg: some files run beyond 2100 or overlap the other experiment
         year = ds["time"].dt.year
         keep = ((year >= years[0]) & (year <= years[1])).values
@@ -173,13 +216,16 @@ def _open_runs(files, variable, years):
     return _join_time(parts).sortby("time")
 
 
-def load_member_monthly(files: dict, variable: str, scenario: str, period, domain: dict):
+def load_member_monthly(files: dict, variable: str, scenario: str, period, domain: dict, with_global_mean=False, mask_for=None):
     """
     joined monthly data (historical until 2014, scenario from 2015) of one member, cut to the
-    domain; returns (DataArray, info) or (None, reason)
+    domain; returns (DataArray, info) or (None, reason). With `with_global_mean`, info["global_mean"]
+    holds the monthly global mean of the full native field (read lazily in chunks), restricted to
+    `mask_for(native field)` if given.
     """
-    hist = _open_runs(files["historical"], variable, (period[0], HIST_END))
-    scen = _open_runs(files[scenario], variable, (HIST_END + 1, period[1]))
+    chunks = {"time": 120} if with_global_mean else None
+    hist = _open_runs(files["historical"], variable, (period[0], HIST_END), chunks)
+    scen = _open_runs(files[scenario], variable, (HIST_END + 1, period[1]), chunks)
     if hist is None or scen is None:
         return None, "no data in period"
     ds = _join_time([hist, scen])
@@ -201,6 +247,9 @@ def load_member_monthly(files: dict, variable: str, scenario: str, period, domai
         "last_month": str(time.values[-1])[:7],
         "calendar": time.values[0].calendar,
     }
+    if with_global_mean:
+        native = ds[variable]
+        info["global_mean"] = global_mean(native, mask_for(native) if mask_for else None).load()
     return da, info
 
 
@@ -225,9 +274,10 @@ def get_regridder(src: xr.DataArray, tgt: xr.Dataset, method: str, weights_file:
 
 
 #---------------main routine--------------#
-def field_store(cfg, variable: str, aggregation: str) -> Path:
-    """folder of the regridded archive of one variable/aggregation (hash over all relevant settings)"""
-    fcfg = cfg["preprocess"]["fields"][variable]
+def field_store(cfg, field: str, aggregation: str) -> Path:
+    """folder of the regridded archive of one field/aggregation (hash over all relevant settings)"""
+    fcfg = cfg["preprocess"]["fields"][field]
+    variable = field_variable(cfg, field)
     record = {
         "variable": variable,
         "aggregation": aggregation,
@@ -237,12 +287,22 @@ def field_store(cfg, variable: str, aggregation: str) -> Path:
         "grid_spacing": cfg["preprocess"]["grid_spacing"],
         "period": cfg["cmip6"]["period"],
     }
-    return Path(cfg["paths"]["outputs"]["cmip6_processed"]) / f"{variable}_{aggregation}" / config_hash(record), record
+    # only recorded when not the default, so the stores of the other variables keep their hashes
+    if fcfg.get("global_mean"):
+        record["global_mean"] = fcfg["global_mean"] if fcfg["global_mean"] == "ocean" else True
+        if fcfg["global_mean"] == "ocean":
+            record["mask"] = "ERA5 SST"
+    if cmip6_table(cfg, variable) != "Amon":
+        record["table"] = cmip6_table(cfg, variable)
+    if field != variable:
+        record["field"] = field
+    return Path(cfg["paths"]["outputs"]["cmip6_processed"]) / f"{field}_{aggregation}" / config_hash(record), record
 
 
-def process_model(cfg, model: str, variants: dict, variable: str, scenario: str, stores: dict):
+def process_model(cfg, model: str, variants: dict, field: str, scenario: str, stores: dict):
     """process all members of one model and write one zarr per aggregation"""
-    fcfg = cfg["preprocess"]["fields"][variable]
+    fcfg = cfg["preprocess"]["fields"][field]
+    variable = field_variable(cfg, field)
     model_ids = load_model_ids()
     if model not in model_ids:
         raise KeyError(f"{model} has no id in configs/model_ids.yaml - append it there")
@@ -257,10 +317,20 @@ def process_model(cfg, model: str, variants: dict, variable: str, scenario: str,
     weights_dir = Path(cfg["paths"]["outputs"]["cmip6_processed"]) / "regrid_weights"
     regridders = {}
     results = {agg: [] for agg in todo}
+    with_gm = bool(fcfg.get("global_mean"))
+    global_means = {agg: [] for agg in todo}
+    masks_by_grid = {}
+
+    def mask_for(native):
+        key = grid_key(native)
+        if key not in masks_by_grid:
+            masks_by_grid[key] = global_mean_mask(cfg, fcfg.get("global_mean"), native)
+        return masks_by_grid[key]
+
     report = []
     for variant, files in variants.items():
         try:
-            da, info = load_member_monthly(files, variable, scenario, cfg["cmip6"]["period"], fcfg["domain"])
+            da, info = load_member_monthly(files, variable, scenario, cfg["cmip6"]["period"], fcfg["domain"], with_gm, mask_for)
         except Exception as err:  # e.g. a corrupt file: drop the member, keep the run going
             da, info = None, f"could not read: {err}"
         if da is None:
@@ -275,10 +345,14 @@ def process_model(cfg, model: str, variants: dict, variable: str, scenario: str,
             seas = seasonal_mean(da, fcfg["aggregations"][agg])
             seas = regridders[key](seas, keep_attrs=True).astype("float32")
             info[f"nan_fraction_{agg}"] = round(float(seas.isnull().all("year").mean()), 4)
-            if bool((seas == 0).any()):
+            if variable not in ZERO_ALLOWED and bool((seas == 0).any()):
                 raise ValueError(f"{model} {variant}: exact zeros in the regridded {variable} field")
             seas = seas.expand_dims(member=[f"{mid}{variant}"])
             results[agg].append(seas)
+            if with_gm:
+                gm = seasonal_mean(info["global_mean"], fcfg["aggregations"][agg]).astype("float32")
+                global_means[agg].append(gm.drop_vars([c for c in gm.coords if c != "year"]).expand_dims(member=[f"{mid}{variant}"]))
+        info.pop("global_mean", None)
         report.append({"model": model, "variant": variant, "kept": True, **info})
 
     kept = [r for r in report if r["kept"]]
@@ -296,29 +370,32 @@ def process_model(cfg, model: str, variants: dict, variable: str, scenario: str,
             last_month=("member", [r["last_month"] for r in kept]),
         )
         ds = data.to_dataset(name=variable)
+        if with_gm:
+            ds[f"{variable}_global_mean"] = xr.concat(global_means[agg], dim="member", join="outer").reindex(member=ds.member, year=ds.year)
         ds.attrs = {"model": model, "scenario": scenario, "aggregation": agg, "months": str(fcfg["aggregations"][agg]), "regrid_method": fcfg["method"]}
         path = ensure_writable(out_files[agg], cfg, overwrite=cfg["preprocess"]["overwrite"])
         ds.chunk({"member": 1, "year": -1, "lat": -1, "lon": -1}).to_zarr(path, mode="w")
     return {"model": model, "status": "written", "report": report}
 
 
-def _process_model_safe(cfg, model, variants, variable, scenario, stores):
+def _process_model_safe(cfg, model, variants, field, scenario, stores):
     """a failing model is reported at the end instead of stopping the other models"""
     try:
-        return process_model(cfg, model, variants, variable, scenario, stores)
+        return process_model(cfg, model, variants, field, scenario, stores)
     except Exception as err:
         return {"model": model, "status": f"FAILED: {err}"}
 
 
-def run(cfg, variables=None, scenarios=None):
-    """preprocess all models of the given variables/scenarios (defaults: all configured)"""
-    variables = variables or list(cfg["preprocess"]["fields"])
+def run(cfg, fields=None, scenarios=None):
+    """preprocess all models of the given fields/scenarios (defaults: the fields the configuration uses)"""
+    fields = fields or used_fields(cfg)
     scenarios = scenarios or cfg["cmip6"]["scenarios"]
-    for variable in variables:
-        fcfg = cfg["preprocess"]["fields"][variable]
+    for field in fields:
+        fcfg = cfg["preprocess"]["fields"][field]
+        variable = field_variable(cfg, field)
         stores = {}
         for agg in fcfg["aggregations"]:
-            store, record = field_store(cfg, variable, agg)
+            store, record = field_store(cfg, field, agg)
             if not (store / "config.yaml").exists():
                 write_yaml(record, store / "config.yaml", cfg)
             stores[agg] = store
@@ -327,16 +404,16 @@ def run(cfg, variables=None, scenarios=None):
             if not found:
                 log.info(f"no {variable} data for {scenario}")
                 continue
-            log.info(f"{variable} {scenario}: {len(found)} models, {sum(len(v) for v in found.values())} members (input {members_hash(cfg, variable, scenario)})")
+            log.info(f"{field} {scenario}: {len(found)} models, {sum(len(v) for v in found.values())} members (input {members_hash(cfg, variable, scenario)})")
             results = Parallel(n_jobs=cfg["resources"]["n_jobs"])(
-                delayed(_process_model_safe)(cfg, model, variants, variable, scenario, stores) for model, variants in found.items()
+                delayed(_process_model_safe)(cfg, model, variants, field, scenario, stores) for model, variants in found.items()
             )
             rows = [row for res in results for row in res.get("report", [])]
             if rows:
                 report_file = stores[list(stores)[0]] / f"report_{scenario}_{pd.Timestamp.now():%Y%m%d%H%M%S}.csv"
                 pd.DataFrame(rows).to_csv(ensure_writable(report_file, cfg), index=False)
             for res in results:
-                log.info(f"{variable} {scenario} {res['model']}: {res['status']}")
+                log.info(f"{field} {scenario} {res['model']}: {res['status']}")
 
 
 def _open_model(path) -> xr.Dataset:
@@ -352,17 +429,18 @@ def _open_model(path) -> xr.Dataset:
     return ds.reset_encoding()
 
 
-def open_field(cfg, variable: str, aggregation: str, scenario: str) -> xr.Dataset:
+def open_field(cfg, field: str, aggregation: str, scenario: str) -> xr.Dataset:
     """
-    all models of one variable/aggregation/scenario as one dataset (member, year, lat, lon): the stores
-    that match the current archive (models without a store, e.g. without valid members, are logged)
+    all models of one field/aggregation/scenario as one dataset (member, year, lat, lon), data variable
+    named after the CMIP6 variable: the stores that match the current archive (models without a store,
+    e.g. without valid members, are logged)
     """
-    store, _ = field_store(cfg, variable, aggregation)
-    expected = {model: model_store(store, scenario, model, variants) for model, variants in members(cfg, variable, scenario).items()}
+    store, _ = field_store(cfg, field, aggregation)
+    expected = {model: model_store(store, scenario, model, variants) for model, variants in members(cfg, field_variable(cfg, field), scenario).items()}
     files = [fl for fl in expected.values() if fl.exists()]
     missing = sorted(model for model, fl in expected.items() if not fl.exists())
     if missing:
-        log.warning(f"{variable} {aggregation} {scenario}: no preprocessed store for {len(missing)} of {len(expected)} models ({', '.join(missing)}); run the preprocessing if the archive changed")
+        log.warning(f"{field} {aggregation} {scenario}: no preprocessed store for {len(missing)} of {len(expected)} models ({', '.join(missing)}); run the preprocessing if the archive changed")
     if not files:
-        raise FileNotFoundError(f"no preprocessed {variable} {aggregation} {scenario} in {store} for the current archive")
+        raise FileNotFoundError(f"no preprocessed {field} {aggregation} {scenario} in {store} for the current archive")
     return xr.concat([_open_model(fl) for fl in files], dim="member", join="outer")

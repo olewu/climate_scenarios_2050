@@ -104,16 +104,41 @@ One configurable generator:
 - Cost: ~1.7 h per scenario and wind variable with 1000 surrogates and 4 workers (0.25 deg grid).
 
 ### Predictors
-Generic index interface: an index = (source variable, season/aggregation, domain, method).
-Methods: EOF mode k projected on a common pattern (implemented first), box difference
-(station NAO), jet latitude/speed (needs CMIP6 `ua`, not downloaded yet), AMV (SST; needs obs
-SST choice). Single predictor for now; code takes a list so multi-predictor matching/regression
-can be added later.
+Generic index interface (`predictor`): an index = (variable, aggregation, domain, method), computed
+for the observational datasets `predictor.obs_datasets` (read as described in `obs_sources`) and
+all CMIP6 members. Methods: EOF mode k projected on a common pattern, box difference (station NAO);
+jet latitude/speed (`ua` at 850 hPa) still to come. NAO-only parts are optional settings of the
+predictor or of `obs`: the HadSLP/ERA5 merge (`obs.merge`, null to switch off), the DCPP marker
+(`predictor.reference_skill`), the preselection lists.
+- SST predictors (e.g. PDO): `tos` from the CMIP6 table Omon (`cmip6.tables`); land points (NaN in
+  all samples) are left out of the EOF and the projection; `predictor.remove_global_mean` subtracts
+  the area-weighted global mean (stored with the field, `preprocess.fields.<var>.global_mean`).
+- Domains may cross the date line (`lon: [west, east]` with west > east, e.g. [110, -100]); their
+  fields use longitudes 0 ... 360 (`core/domain.py`).
+- Fields are named entries of `preprocess.fields` (`variable` defaults to the name), so one variable
+  can be a predictor and a target with different domains (`predictor.field`, e.g. `tas_np`).
+- `predictor.mask: ocean` restricts the index field to the ocean, `global_mean: ocean` the global
+  mean (mask from ERA5 SST, nearest neighbour on each grid, also on the models' native grids).
+- Examples: `configs/experiments/south_america_pdo.yaml` (needs CMIP6 tos and a long SST record);
+  `configs/experiments/pdo_from_tas.yaml`, a PDO-like index from tas over the ocean as a test with
+  existing data (ERA5: corr. 0.96 with the PDO from ERA5 SST, 1940-2025).
+
+### Regions and targets
+- `region`: domain of the prediction targets, the active targets and the sites. The CMIP6 fields
+  of the targets use `domain: region` (resolved when the config is loaded).
+- `targets`: registry of prediction targets, each with its observations (`source: file` for prepared
+  files such as the GWA-scaled wind, or a dataset of `obs_sources`, e.g. ERA5 tas/pr/10 m wind),
+  its CMIP6 variable for M2a/M3a and option (b) (`cmip6`, null for energy) and its `change`
+  (relative % or absolute). Observed targets are annual means on their own grid, cut to the region.
+- The CMIP6 data of a target enter only in `hindcast-target` (per scenario and target, with the
+  MMEM for option b) and the forecast; the split and the index steps depend on the predictor only.
 
 ### Preprocessing CMIP6
 - From the original files in `data/CMIP6/{historical,sspXXX}` (-> `/datalake/NS9873K/DATA/CMIP6`).
 - Historical + scenario joined **per member at monthly resolution** before seasonal averaging
   (fixes the DJFM 2014 gap). Only members with both historical and scenario runs.
+- Only the fields the configuration uses are processed (predictor variable and the targets' CMIP6
+  variables).
 - Aggregate on the native grid first (DJFM for indices; annual, DJF, JJA for sfcWind),
   months weighted by their length in each model's own calendar, then calendar dropped; then
   regrid (bilinear for psl/sfcWind/tas, conservative for pr) to a global 1.5° grid, weights
@@ -128,9 +153,10 @@ can be added later.
   `<model>_<key>.zarr`, with the key a hash of its members and their file names. New members or
   files give a new store (old stores stay), and only the changed models are regridded again.
   Downstream, the member list enters per scenario: the CMIP6 indices have their own output per
-  scenario (`indices_cmip6/<hash>/`, separate from the observed indices in `indices/<hash>/`), and the
-  split of a scenario depends on that scenario's psl and sfcWind member lists. A download for one
-  scenario therefore leaves the hashes of the other scenarios unchanged. Run the preprocessing after
+  scenario (`indices_cmip6/<hash>/`, separate from the observed indices in `indices/<hash>/`); the
+  split of a scenario depends on that scenario's predictor members, and each target's hindcast inputs
+  on the members of its CMIP6 variable. A download for one scenario or one target variable therefore
+  leaves the other hashes unchanged. Run the preprocessing after
   a download has finished, not while files are still arriving.
 
 ### Output, safety, environment
@@ -162,11 +188,13 @@ src/climate_scenarios_2050/
   split/       forced.py (MMEM / polynomial / low-pass; model + obs scaling; leave-out C)
   analogues/   filters.py, matching.py (measures, subsample, shift, two-stage, pre-selection),
                generate.py (hindcasts per init year), synthetic.py (AR(1) null obs)
-  baselines/   nao.py (AR(1), FFT/sine, persistence, climatology), wind.py (persistence)
+  core/domain.py  domains, incl. crossing the date line
+  cmip_retrieval/ esgf.py, inventory.py, download.py (CMIP6 inventory and download)
+  baselines/   index.py (AR(1), FFT/sine, persistence)
   linear_model/ fit.py (per window length, leave-out, saved per init/target)
-  methods/     wind.py (M1-M3b, component bookkeeping, relative/absolute)
+  methods/     target.py (CMIP6 inputs of M2a-M3b per target)
   evaluate/    metrics.py (deterministic, CRPS, Brier), significance.py (block bootstrap,
-               phase randomization; from evaluate.py), nao.py, wind.py
+               phase randomization), surrogates.py, index.py, target.py
   forecast/    forecast.py (any init year allowed by the data, all methods/scenarios)
   update/      update_index.py (new ERA5 winter + saved pattern -> extended merged index)
   plotting/
@@ -175,73 +203,24 @@ src/climate_scenarios_2050/
 
 Each step is run as `pixi run <step> --config configs/default.yaml [--config configs/experiments/x.yaml]`:
 
-1. `preprocess` - regrid/aggregate CMIP6; observed fields; patterns; indices (obs + CMIP6).
-2. `split` - forced/internal for CMIP6 indices, CMIP6 sfcWind (MMEM only), observed indices,
-   observed wind.
-3. `hindcast-nao` - analogue hindcasts (+ synthetic null); `evaluate-nao` incl. baselines.
-4. `linear-model` - NAO -> wind (and energy) per window length, leave-out.
-5. `hindcast-wind` + `evaluate-wind` - M1-M3b on the target windows.
+0. `cmip6-inventory`, `cmip6-download` - CMIP6 archive.
+1. `preprocess` - regrid/aggregate CMIP6; observed fields; observed targets; patterns; indices.
+2. `split` - forced/internal for CMIP6 indices, observed indices, observed targets.
+3. `hindcast-index` - analogue hindcasts (+ synthetic null); `evaluate-index` incl. baselines.
+4. `linear-model` - index -> target per window length, leave-out.
+5. `hindcast-target` + `evaluate-target` - M0-M3b on the target windows, per target.
 6. `forecast --init-year Y` - all methods/scenarios, components stored.
 7. `update-index` - append new winter(s) to the observed index using the frozen pattern and
    frozen harmonization.
 
-## 4. Config schema (defaults)
+## 4. Config schema
 
-```yaml
-run:
-  scenarios_hindcast: [ssp245, ssp370]
-  scenarios_forecast: [ssp119, ssp126, ssp245, ssp370, ssp585]
-  resources: {n_jobs: -5, dask_threads: 4, member_chunk: 20}
-preprocess:
-  grid: {spacing: 1.5}
-  regrid_method: {psl: bilinear, sfcWind: bilinear, tas: bilinear, pr: conservative}
-  sfcWind_aggregations: [annual, DJF, JJA]
-  keep_monthly: false
-  overwrite: false
-predictor:
-  name: nao
-  variable: psl
-  season: [12, 1, 2, 3]
-  domain: {lon: [-90, 40], lat: [20, 80]}
-  method: eof
-  mode: 1
-  normal_period: [1950, 2015]
-  pattern_source: ERA5          # ERA5 | HadSLP | 20CR | own
-  sign_reference_point: {lat: 35.25, lon: -20.25}
-obs:
-  matching_index: merged         # merged | HadSLP | 20CR | ERA5
-  merge: {year: 1980, harmonization_period: [1940, 2018]}   # full ERA5/HadSLP overlap (complete seasons)
-  training_index: ERA5
-  wind: {variable: wsp100}       # wsp100 | energy
-split:
-  method: mmem                   # mmem | polynomial | lowpass_mmem
-  weighting: model               # model | member
-  polynomial_degree: 2
-  lowpass: {cutoff_period: 5, order: 4}
-  obs_leakage: leave_target_out  # leave_target_out (C) | full_period (A)
-analogues:
-  selection: subsample           # subsample | shift | shift_subsample
-  measure: CORR                  # CORR | RMSE | two_stage
-  filter: {type: running_mean, length: 41, min_periods_frac: 0.25}
-  window: 70
-  M: 100
-  max_lag: 25
-  preselection: null
-  model_filter_at_init: full     # full (default, as before) | cut (same as obs)
-  synthetic_null: {enabled: true, n: 500}
-target:
-  windows: [[1,5],[6,10],[11,15],[16,20],[21,25],[26,30],[1,10],[11,20],[21,30],[1,20],[11,30]]
-  reference_length: 20
-  nao_wind_lag: 1
-  change: relative               # relative | absolute
-linear_model:
-  leave_out: overlap_target      # exclude training windows overlapping the target window
-forced_wind: nao_mmem            # nao_mmem (a) | cmip6_sfcwind (b) | none (c)
-evaluation:
-  quantiles: [0.5, 0.9]
-  bootstrap: {n: 1000, method: moving_block}
-  nao_continuous: {running_mean: 8, lead_times: [1, 33]}
-```
+`configs/default.yaml` is the reference (commented). Main blocks: `cmip6` (scenarios, weighting,
+tables, minimum scenario end), `download`, `region`, `targets`, `obs_sources`, `preprocess.fields`,
+`predictor`, `obs` (matching/training index, merge, default forecast target), `split`, `analogues`,
+`baselines`, `target` (windows, reference, lag), `linear_model`, `forced_target`, `evaluation`,
+`update`. The config is validated when it is loaded (unknown targets, datasets without the predictor
+variable, missing fields, ...).
 
 ## 5. Bugs found in the existing code (fixed in the new code)
 
@@ -298,7 +277,7 @@ Earlier analogue skill results may change noticeably after fix 1.
 | `nao_ar1_lofreq_forecast.py`, `nao_fft_forecast.py` | `baselines/nao.py` |
 | `evaluate.py` (bootstrap), `evaluate_full_synth.py` | `evaluate/significance.py`, `evaluate/nao.py` |
 | `linear_model_wsp_NAO.py` | `linear_model/fit.py` |
-| `verify_full_pred_wsp.py`, `verify_wind_hindcasts.py` | `methods/wind.py`, `evaluate/wind.py` |
+| `verify_full_pred_wsp.py`, `verify_wind_hindcasts.py` | `methods/target.py`, `evaluate/target.py` |
 | `wind_pred_functionality.py` | `forecast/forecast.py` |
 | `filters.py`, `spectral_analysis.py`, `utils.py` (parts) | `analogues/filters.py`, `core/` |
 | plotting scripts, notebooks, `figure_presentation.py`, field hindcast scripts, `cmip_retrieval/`, `update_era5.py` | `plotting/` or `legacy/` (download scripts unchanged) |

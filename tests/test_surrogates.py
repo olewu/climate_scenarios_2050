@@ -3,7 +3,7 @@ import xarray as xr
 
 from climate_scenarios_2050.evaluate import metrics
 from climate_scenarios_2050.evaluate import surrogates as sg
-from climate_scenarios_2050.evaluate import wind as ev
+from climate_scenarios_2050.evaluate import target as ev
 
 
 def ar1(n, points, phi, rng):

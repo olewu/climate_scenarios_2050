@@ -24,9 +24,8 @@ with warnings.catch_warnings():
 
 COLORS = {"analogue": "C0", "cmip6_all": "k", "ar1_fair": "C1", "ar1_all": "C3", "sine_trend": "C2", "persistence": "C5"}
 
-# DCPP multi-model NAO correlation skill for lead years 2-9 (8-year means), range shown as a bar
-# at the centre lead time (hard-coded as in the old figures)
-DCPP_REFERENCE = {"lead": 5.5, "low": 0.57, "high": 0.79, "label": "  DCPP (LY2-9)"}
+# reference skill (e.g. the DCPP multi-model NAO correlation for lead years 2-9) from
+# `predictor.reference_skill`, shown as a bar at its centre lead time
 FIXED_LEADS = {5: "solid", 15: "dashed", 25: "dotted"}
 
 
@@ -42,7 +41,7 @@ def _lines(ax, ds, measure, null=None):
     ax.set_xlabel("lead time [years]")
 
 
-def legacy_skill_figure(cont, null, measure, index_name, path):
+def legacy_skill_figure(cont, null, measure, index_name, path, reference=None):
     """skill per lead time in the old design"""
     title, ylabel, ylim, legend_loc = {
         "corr": ("Correlation Skill", "Correlation", (-0.4, 0.9), 3),
@@ -62,10 +61,10 @@ def legacy_skill_figure(cont, null, measure, index_name, path):
     ax.fill_between(leads, sel("analogue", "ci_low"), sel("analogue", "ci_high"), alpha=0.2, color="C0", label="CI analogue")
     if null is not None:
         ax.plot(null.lead.values, null[f"continuous_{measure}_p95"].values, color="k", label="random 95th", ls="dotted")
-    if measure == "corr":
-        ref = DCPP_REFERENCE
+    if measure == "corr" and reference:
+        ref = reference
         ax.plot([ref["lead"], ref["lead"]], [ref["low"], ref["high"]], color="k", marker="_")
-        ax.annotate(text=ref["label"], xy=(ref["lead"], ref["high"] + 0.01), ha="left", va="center")
+        ax.annotate(text="  " + ref["label"], xy=(ref["lead"], ref["high"] + 0.01), ha="left", va="center")
     ax.legend(loc=legend_loc, ncol=3)
     ax.format(ylim=list(ylim), xlim=[leads[0], leads[-1]])
     fig.savefig(path, dpi=300, bbox_inches="tight")
@@ -120,7 +119,7 @@ def hindcast_figure(ov: xr.Dataset, scenario, path, lock_year=1985):
 
 
 def plot_evaluation(cfg, out, scenario):
-    fig_dir = Path(cfg["paths"]["outputs"]["figures"]) / "evaluate_nao" / out.hash
+    fig_dir = Path(cfg["paths"]["outputs"]["figures"]) / "evaluate_index" / out.hash
     fig_dir.mkdir(parents=True, exist_ok=True)
     cont = xr.open_dataset(out.path("continuous.nc"))
     win = xr.open_dataset(out.path("windows.nc"))
@@ -128,7 +127,7 @@ def plot_evaluation(cfg, out, scenario):
     index_name = cfg["predictor"]["name"].upper()
 
     for measure, tag in [("corr", "corr"), ("nrmse", "rmsess")]:
-        legacy_skill_figure(cont, null, measure, index_name, fig_dir / f"skill_{tag}_{scenario}.png")
+        legacy_skill_figure(cont, null, measure, index_name, fig_dir / f"skill_{tag}_{scenario}.png", cfg["predictor"].get("reference_skill"))
     if out.exists("hindcast_overview.nc"):
         hindcast_figure(xr.open_dataset(out.path("hindcast_overview.nc")), scenario, fig_dir / f"hindcast_{scenario}.png")
 

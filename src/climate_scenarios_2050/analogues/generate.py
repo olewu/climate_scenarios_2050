@@ -1,5 +1,5 @@
 """
-Step 3: analogue hindcasts of the predictor index (`<root>/hindcast_nao/<hash>/`, per scenario).
+Step 3: analogue hindcasts of the predictor index (`<root>/hindcast_index/<hash>/`, per scenario).
 
 `hindcast.nc`: `index` (init_year, rank, lead): internal variability of the selected members,
 relative to the init year (lead = year - init, negative leads are the members' past, needed for the
@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 
 def hindcast_output(cfg, scenario: str) -> StepOutput:
     return StepOutput(
-        cfg, "hindcast_nao", sections=["analogues"],
+        cfg, "hindcast_index", sections=["analogues"],
         extra={"scenario": scenario, "matching_index": cfg["obs"]["matching_index"], "reference_length": cfg["target"]["reference_length"], "predictor_lag": cfg["target"]["predictor_lag"]},
         upstream={"split": split_output(cfg, scenario).hash},
     )

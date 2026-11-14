@@ -19,7 +19,7 @@ applying them to d repeats the leave-out split for every surrogate (excluded yea
 anomaly, which raises the correlation of reference and window means and has to be in the null too):
   target*  = target + (WL d - RL d) * to_units
   pred_m*  = pred_m - c_m * RL d * to_units, c_m = 1 for the methods subtracting the observed
-             internal reference (M0, M2b, M3b, *_b, perfect_nao), 0 for M1, M2a, M3a
+             internal reference (M0, M2b, M3b, *_b, perfect_index), 0 for M1, M2a, M3a
   M1 spread recomputed from target* (also the CRPSS reference)
 With d = 0 this reproduces the actual scores. The regression parameters of the linear model are
 kept fixed (the test is conditional on the predictions), as is the conversion to % (to_units).
@@ -50,7 +50,7 @@ log = logging.getLogger(__name__)
 
 STATISTICS = ["dcrpss", "dcorr", "corr_anom"]
 # methods whose prediction contains "- observed internal reference"
-WITH_REFERENCE = {"M0", "M2b", "M3b", "M2b_b", "M3b_b", "perfect_nao"}
+WITH_REFERENCE = {"M0", "M2b", "M3b", "M2b_b", "M3b_b", "perfect_index"}
 
 
 #---------------surrogates--------------#
@@ -112,7 +112,7 @@ def observation_operators(cfg, scenario, years, init_years, windows):
     """operators for the observed internal window and reference means as used in the evaluation"""
     ref_len = cfg["target"]["reference_length"]
     win, ref = averaging_operators(years, init_years, windows, ref_len)
-    design = SplitResults(cfg, scenario).wind_design(years).values
+    design = SplitResults(cfg, scenario).target_design(years).values
     if cfg["split"]["obs_leakage"] == "full_period":
         excluded = np.zeros(len(years), dtype=bool)
     else:
@@ -124,12 +124,12 @@ def observation_operators(cfg, scenario, years, init_years, windows):
     return np.nan_to_num(win_lo), np.nan_to_num(ref_lo)
 
 
-def observed_internal_wind(cfg, scenario, wind_variable):
+def observed_internal_target(cfg, scenario, target_variable):
     """observed annual internal wind, forced part fitted to all years (year, latitude, longitude)"""
     split = SplitResults(cfg, scenario)
-    wind = obs.open_obs_wind(cfg, wind_variable)
-    coef = split.wind_coef(wind_variable, "coef_full").load()
-    internal = wind - (split.wind_design(wind.year.values) * coef).sum("term", skipna=False)
+    wind = obs.open_obs_target(cfg, target_variable)
+    coef = split.target_coef(target_variable, "coef_full").load()
+    internal = wind - (split.target_design(wind.year.values) * coef).sum("term", skipna=False)
     return internal.dropna("year", how="all")
 
 
@@ -258,12 +258,12 @@ def fdr_mask(p: np.ndarray, q: float) -> np.ndarray:
     return sig.reshape(p.shape)
 
 
-def surrogate_test(cfg, scenario, wind_variable, targets, methods, to_units) -> xr.Dataset:
+def surrogate_test(cfg, scenario, target_variable, targets, methods, to_units) -> xr.Dataset:
     scfg = cfg["evaluation"]["significance"]
     windows = [tuple(w) for w in cfg["target"]["windows"]]
     labels = [window_label(w) for w in windows]
     kinds = list(targets)
-    names = sorted({m for kind in kinds for m in methods[kind]}, key=lambda m: ["M0", "M1", "M2a", "M3a", "M2b", "M3b", "M2b_b", "M3b_b", "perfect_nao"].index(m))
+    names = sorted({m for kind in kinds for m in methods[kind]}, key=lambda m: ["M0", "M1", "M2a", "M3a", "M2b", "M3b", "M2b_b", "M3b_b", "perfect_index"].index(m))
 
     template = targets[kinds[0]].transpose("init_year", "window", "latitude", "longitude")
     inits = template.init_year.values
@@ -282,7 +282,7 @@ def surrogate_test(cfg, scenario, wind_variable, targets, methods, to_units) -> 
     tu = to_units.sel(init_year=inits).transpose("init_year", "latitude", "longitude").values.reshape(len(inits), -1)
 
     # observed internal wind, contiguous years covering all windows and references
-    u = observed_internal_wind(cfg, scenario, wind_variable).transpose("year", "latitude", "longitude")
+    u = observed_internal_target(cfg, scenario, target_variable).transpose("year", "latitude", "longitude")
     years = u.year.values
     if np.any(np.diff(years) != 1):
         raise ValueError(f"observed internal wind has gaps: {years}")
@@ -298,7 +298,7 @@ def surrogate_test(cfg, scenario, wind_variable, targets, methods, to_units) -> 
 
     chunk = scfg["chunk_points"]
     starts = range(0, n_lat * n_lon, chunk)
-    log.info(f"surrogate test {scenario} {wind_variable}: {scfg['n']} surrogates, {len(names)} methods, {n_lat * n_lon} points in {len(starts)} chunks")
+    log.info(f"surrogate test {scenario} {target_variable}: {scfg['n']} surrogates, {len(names)} methods, {n_lat * n_lon} points in {len(starts)} chunks")
     jobs = []
     for s in starts:
         sl = slice(s, s + chunk)

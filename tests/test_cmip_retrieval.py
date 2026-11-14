@@ -15,16 +15,19 @@ def frame(rows, cols):
 
 
 def test_plan_selects_usable_members_and_grids():
-    cols = ["variable", "experiment", "model", "member", "grid", "version", "size", "n_files", "dataset_id", "data_nodes"]
+    cols = ["variable", "experiment", "model", "member", "grid", "version", "size", "n_files", "end", "dataset_id", "data_nodes"]
     remote = frame([
-        ["psl", "historical", "A", "r1i1p1f1", "gn", 1, 10, 1, "a", "n"],
-        ["psl", "ssp245", "A", "r1i1p1f1", "gn", 1, 5, 1, "b", "n"],
-        ["psl", "ssp245", "A", "r1i1p1f1", "gr", 1, 4, 1, "c", "n"],
-        ["psl", "ssp245", "A", "r2i1p1f1", "gn", 1, 5, 1, "d", "n"],    # no historical anywhere: not usable
-        ["psl", "ssp370", "B", "r1i1p1f1", "gr", 1, 7, 1, "e", "n"],    # historical only locally (gr)
-        ["psl", "ssp370", "B", "r1i1p1f1", "gn", 1, 6, 1, "f", "n"],
+        ["psl", "historical", "A", "r1i1p1f1", "gn", 1, 10, 1, 2014, "a", "n"],
+        ["psl", "ssp245", "A", "r1i1p1f1", "gn", 1, 5, 1, 2100, "b", "n"],
+        ["psl", "ssp245", "A", "r1i1p1f1", "gr", 1, 4, 1, 2100, "c", "n"],
+        ["psl", "ssp245", "A", "r2i1p1f1", "gn", 1, 5, 1, 2100, "d", "n"],    # no historical anywhere: not usable
+        ["psl", "ssp370", "B", "r1i1p1f1", "gr", 1, 7, 1, float("nan"), "e", "n"],   # historical only locally (gr); end unknown
+        ["psl", "ssp370", "B", "r1i1p1f1", "gn", 1, 6, 1, 2100, "f", "n"],
+        ["psl", "historical", "C", "r1i1p1f1", "gn", 1, 10, 1, 2014, "g", "n"],
+        ["psl", "ssp245", "C", "r1i1p1f1", "gn", 1, 1, 1, 2020, "h", "n"],     # short run only: member not usable
+        ["psl", "ssp245", "B", "r1i1p1f1", "gr", 1, 1, 1, 2020, "i", "n"],     # short run of a usable member
     ], cols)
-    local = frame([["psl", "historical", "B", "r1i1p1f1", "gr", 1, 99, "185001", "201412"]],
+    local = frame([["psl", "historical", "B", "r1i1p1f1", "gr", 1, 99, "185001", 2014]],
                   ["variable", "experiment", "model", "member", "grid", "n_files", "size", "start", "end"])
     p = inv.plan(remote, local, ["ssp245", "ssp370"]).set_index(["model", "member", "experiment"])
     assert ("A", "r2i1p1f1", "ssp245") not in p.index
@@ -33,6 +36,8 @@ def test_plan_selects_usable_members_and_grids():
     assert p.loc[("B", "r1i1p1f1", "historical"), "status"] == "local"
     assert p.loc[("B", "r1i1p1f1", "ssp370"), "grid"] == "gr"     # the member's local grid wins over gn
     assert p.loc[("A", "r1i1p1f1", "historical"), "status"] == "download"
+    assert ("C", "r1i1p1f1", "historical") not in p.index
+    assert p.loc[("B", "r1i1p1f1", "ssp245"), "status"] == "short"
 
 
 def test_in_period():

@@ -1,0 +1,34 @@
+# Test of the SST-predictor chain on data that is already there: a PDO-like index from near-surface air
+# temperature over the ocean (CMIP6 tas, ERA5 t2m), with the global mean over the ocean removed.
+# Combine with the region/targets of south_america_pdo.yaml:
+#   --config configs/experiments/south_america_pdo.yaml --config configs/experiments/pdo_from_tas.yaml
+# or use it alone with the European targets. ERA5 starts in 1940: with a 70-year matching window there are
+# hardly any hindcast inits, so this tests the code, not the skill.
+preprocess:
+  fields:
+    tas_np:
+      variable: tas
+      method: bilinear
+      aggregations: {annual: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]}
+      domain: {lon: [100, -80], lat: [0, 75]}   # North Pacific, crosses the date line
+      global_mean: ocean
+
+predictor:
+  name: pdo_tas
+  method: eof
+  variable: tas
+  field: tas_np
+  aggregation: annual
+  domain: {lon: [110, -100], lat: [20, 70]}
+  mode: 1
+  pattern_source: ERA5
+  obs_datasets: [ERA5]
+  remove_global_mean: true
+  mask: ocean
+  sign_reference_point: {lat: 45.75, lon: -130.25}
+  reference_skill: null
+
+obs:
+  matching_index: ERA5
+  training_index: ERA5
+  merge: null

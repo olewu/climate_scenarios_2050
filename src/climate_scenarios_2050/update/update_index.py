@@ -18,9 +18,11 @@ from datetime import datetime
 import numpy as np
 import xarray as xr
 
+from climate_scenarios_2050.core import domain as dom
+from climate_scenarios_2050.core.config import predictor_field
 from climate_scenarios_2050.core.io import write_netcdf
 from climate_scenarios_2050.core.timeconv import seasonal_mean
-from climate_scenarios_2050.preprocess import obs
+from climate_scenarios_2050.preprocess import masks, obs
 from climate_scenarios_2050.preprocess.cmip6 import get_regridder, grid_key, target_grid
 from climate_scenarios_2050.preprocess.indices import eof
 from climate_scenarios_2050.preprocess.indices.compute import index_output
@@ -34,22 +36,29 @@ def new_seasons_index(cfg, files=None) -> xr.DataArray:
     if pred["method"] != "eof" or pred["pattern_source"] == "own":
         raise NotImplementedError("the update needs an EOF index with a common pattern")
     variable = pred["variable"]
-    fcfg = cfg["preprocess"]["fields"][variable]
+    field_name = predictor_field(cfg)
+    fcfg = cfg["preprocess"]["fields"][field_name]
     out = index_output(cfg)
     with xr.open_dataset(out.path(f"pattern_{pred['pattern_source']}.nc")) as ds:
         pattern = ds.load()
-    field_out = obs.obs_field_output(cfg, variable)
-    with xr.open_dataset(field_out.path(f"ERA5_{variable}_{pred['aggregation']}.nc")) as ds:
+    field_out = obs.obs_field_output(cfg, field_name)
+    with xr.open_dataset(field_out.path(f"ERA5_{field_name}_{pred['aggregation']}.nc")) as ds:
         history = ds[variable].load()
+        if pred.get("remove_global_mean"):
+            history = history - ds[f"{variable}_global_mean"].load()
     domain = pred["domain"]
-    climatology = eof.normal_period_climatology(history.sel(lat=slice(*domain["lat"]), lon=slice(*domain["lon"])), pred["normal_period"])
+    climatology = eof.normal_period_climatology(dom.select(history, domain), pred["normal_period"])
 
-    monthly = obs.open_obs_monthly(cfg, "ERA5", variable, fcfg["domain"], files=files)
+    months = fcfg["aggregations"][pred["aggregation"]]
+    loaded = obs.open_obs_monthly(cfg, "ERA5", variable, fcfg["domain"], files=files, with_global_mean=fcfg.get("global_mean") if pred.get("remove_global_mean") else False)
+    monthly, gm = loaded if pred.get("remove_global_mean") else (loaded, None)
     tgt = target_grid(cfg["preprocess"]["grid_spacing"], fcfg["domain"])
     weights_file = field_out.dir / "regrid_weights" / f"ERA5_{grid_key(monthly)}_{fcfg['method']}.nc"
     regridder = get_regridder(monthly, tgt, fcfg["method"], weights_file)
-    seasons = regridder(seasonal_mean(monthly, fcfg["aggregations"][pred["aggregation"]]), keep_attrs=True).astype("float32")
-    field = seasons.sel(lat=slice(*domain["lat"]), lon=slice(*domain["lon"]))
+    seasons = regridder(seasonal_mean(monthly, months), keep_attrs=True).astype("float32")
+    if gm is not None:
+        seasons = seasons - seasonal_mean(gm, months).reindex(year=seasons.year)
+    field = masks.apply(cfg, dom.select(seasons, domain), pred.get("mask"))
     return eof.project(field, pattern, pred["mode"], climatology).compute()
 
 
@@ -67,8 +76,10 @@ def run(cfg, files=None):
     tolerance = cfg["update"]["tolerance"]
     with xr.open_dataset(out.path("obs_ERA5.nc")) as ds:
         era5_old = ds.load()
-    with xr.open_dataset(out.path("obs_merged.nc")) as ds:
-        merged_old = ds.load()
+    merged_old = None
+    if cfg["obs"].get("merge"):
+        with xr.open_dataset(out.path("obs_merged.nc")) as ds:
+            merged_old = ds.load()
     new = new_seasons_index(cfg, files)
     last_old = int(era5_old.year.max())
 
@@ -90,16 +101,17 @@ def run(cfg, files=None):
     era5_new = xr.concat([era5_old["index"], added.drop_vars([c for c in added.coords if c != "year"])], dim="year").to_dataset(name="index")
     era5_new.attrs = {**era5_old.attrs, "update_history": "; ".join(filter(None, [era5_old.attrs.get("update_history"), stamp]))}
 
-    attrs = merged_old.attrs
-    harmonized = (added - attrs["late_mean"]) * attrs["early_std"] / attrs["late_std"] + attrs["early_mean"]
-    source = xr.full_like(harmonized.astype(object), cfg["obs"]["merge"]["datasets"][1]).astype(str)
-    merged_new = xr.Dataset({
-        "index": xr.concat([merged_old["index"], harmonized.drop_vars([c for c in harmonized.coords if c != "year"])], dim="year"),
-        "source": xr.concat([merged_old["source"].astype(str), source.drop_vars([c for c in source.coords if c != "year"])], dim="year"),
-    })
-    merged_new.attrs = {**attrs, "update_history": "; ".join(filter(None, [attrs.get("update_history"), stamp]))}
-
+    if merged_old is not None:
+        attrs = merged_old.attrs
+        harmonized = (added - attrs["late_mean"]) * attrs["early_std"] / attrs["late_std"] + attrs["early_mean"]
+        source = xr.full_like(harmonized.astype(object), cfg["obs"]["merge"]["datasets"][1]).astype(str)
+        merged_new = xr.Dataset({
+            "index": xr.concat([merged_old["index"], harmonized.drop_vars([c for c in harmonized.coords if c != "year"])], dim="year"),
+            "source": xr.concat([merged_old["source"].astype(str), source.drop_vars([c for c in source.coords if c != "year"])], dim="year"),
+        })
+        merged_new.attrs = {**attrs, "update_history": "; ".join(filter(None, [attrs.get("update_history"), stamp]))}
     _replace(cfg, out.path("obs_ERA5.nc"), era5_new, last_old)
-    _replace(cfg, out.path("obs_merged.nc"), merged_new, last_old)
+    if merged_old is not None:
+        _replace(cfg, out.path("obs_merged.nc"), merged_new, last_old)
     log.info(stamp)
     return list(added.year.values)

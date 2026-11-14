@@ -1,11 +1,11 @@
 """
 Maps of the linear model (hindcast fits, averaged over the init years):
-- correlation of the predicted and observed internal wind change given the observed index,
+- correlation of the predicted and observed internal target change given the observed index,
   predicted change = slope * (index window mean - index reference mean). Only the part explained by
-  the index change; unlike `perfect_nao` of the wind evaluation, no reversion to the mean is included.
-- wind change for a typical index anomaly: slope * std of the window means of the observed internal
+  the index change; unlike `perfect_index` of the target evaluation, no reversion to the mean is included.
+- target change for a typical index anomaly: slope * std of the window means of the observed internal
   training index (forced part fitted to all years; the leave-out internal window means of the
-  hindcast cases are inflated), in units of the wind data and in % of the mean wind.
+  hindcast cases are inflated), in units of the target data and, for relative targets, in % of the mean.
 """
 
 from pathlib import Path
@@ -18,12 +18,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 
+from climate_scenarios_2050.core.config import target_spec
 from climate_scenarios_2050.linear_model.fit import sliding_means
 from climate_scenarios_2050.preprocess import obs
 from climate_scenarios_2050.split.run import SplitResults
 
 WINDOWS = ["1-5", "1-10", "11-20", "1-20"]
-UNITS = {"wsp100": "m/s"}
+UNITS = {"wsp100": "m/s"}   # files without a units attribute
 
 
 def window_index_std(cfg, scenario, windows) -> xr.DataArray:
@@ -35,13 +36,13 @@ def window_index_std(cfg, scenario, windows) -> xr.DataArray:
     return xr.DataArray([np.nanstd(sliding_means(internal, n)) for n in lengths], dims="window", coords={"window": list(windows)})
 
 
-def plot_linear_model(cfg, out, scenario, wind_variable):
+def plot_linear_model(cfg, out, scenario, target_variable):
     fig_dir = Path(cfg["paths"]["outputs"]["figures"]) / "linear_model" / out.hash
     fig_dir.mkdir(parents=True, exist_ok=True)
     skill = xr.open_dataset(out.path("perfect_index_skill.nc"))
     params = xr.open_dataset(out.path("hindcast.nc"))
-    wind = obs.open_obs_wind(cfg, wind_variable)
-    units = wind.attrs.get("units", UNITS.get(wind_variable, "units of wind"))
+    wind = obs.open_obs_target(cfg, target_variable)
+    units = wind.attrs.get("units") or UNITS.get(target_variable, "units of the target")
     index_std = window_index_std(cfg, scenario, params.window.values)
     change = params["slope"].mean("init_year") * index_std
     relative = change / wind.mean("year") * 100
@@ -49,9 +50,10 @@ def plot_linear_model(cfg, out, scenario, wind_variable):
     rows = [
         (skill["corr"], "corr given obs. index change", {"vmin": -1, "vmax": 1}, "correlation"),
         (change, "change per 1 std index", {"robust": True, "center": 0}, units),
-        (relative, "change per 1 std index", {"robust": True, "center": 0}, "%"),
     ]
-    fig, axes = plt.subplots(len(rows), len(WINDOWS), figsize=(14, 9), subplot_kw={"projection": ccrs.PlateCarree()})
+    if target_spec(cfg, target_variable)["change"] == "relative":
+        rows.append((relative, "change per 1 std index", {"robust": True, "center": 0}, "%"))
+    fig, axes = plt.subplots(len(rows), len(WINDOWS), figsize=(14, 3 * len(rows)), subplot_kw={"projection": ccrs.PlateCarree()}, squeeze=False)
     for jj, (field, name, kwargs, label) in enumerate(rows):
         for ii, window in enumerate(WINDOWS):
             ax = axes[jj, ii]
@@ -61,6 +63,6 @@ def plot_linear_model(cfg, out, scenario, wind_variable):
             if jj > 0:
                 title += f"\n(std of {window} index mean: {float(index_std.sel(window=window)):.2f})"
             ax.set_title(title, fontsize=8)
-    fig.suptitle(f"Linear model {wind_variable}, {scenario}: skill given the observed index change, and wind change for a typical index anomaly")
-    fig.savefig(fig_dir / f"linear_model_{wind_variable}_{scenario}.png", dpi=200, bbox_inches="tight")
+    fig.suptitle(f"Linear model {target_variable}, {scenario}: skill given the observed index change, and target change for a typical index anomaly")
+    fig.savefig(fig_dir / f"linear_model_{target_variable}_{scenario}.png", dpi=200, bbox_inches="tight")
     plt.close(fig)

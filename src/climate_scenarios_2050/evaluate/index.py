@@ -1,5 +1,5 @@
 """
-Step 3b: evaluation of the index hindcasts (`<root>/evaluate_nao/<hash>/`, figures below `figures`).
+Step 3b: evaluation of the index hindcasts (`<root>/evaluate_index/<hash>/`, figures below `figures`).
 
 Two views, for the analogue hindcast, the full CMIP6 ensemble ("climatological" reference), the
 AR(1) and sine + trend baselines:
@@ -23,7 +23,7 @@ from joblib import Parallel, delayed
 
 from climate_scenarios_2050.analogues.generate import hindcast_output, init_years, lead_axis, matching_obs, open_hindcast
 from climate_scenarios_2050.analogues.matching import align_leads, running_mean
-from climate_scenarios_2050.baselines import nao as baselines
+from climate_scenarios_2050.baselines import index as baselines
 from climate_scenarios_2050.core.io import StepOutput, write_netcdf
 from climate_scenarios_2050.core.timeconv import window_label
 from climate_scenarios_2050.evaluate import metrics
@@ -36,8 +36,8 @@ log = logging.getLogger(__name__)
 
 
 def evaluation_output(cfg, scenario) -> StepOutput:
-    # the significance test and the sites of the wind evaluation are not used here
-    return StepOutput(cfg, "evaluate_nao", sections=["evaluation", "baselines"], upstream={"hindcast_nao": hindcast_output(cfg, scenario).hash}, exclude={"evaluation": ["significance", "sites"]})
+    # the significance test of the target evaluation is not used here
+    return StepOutput(cfg, "evaluate_index", sections=["evaluation", "baselines"], upstream={"hindcast_index": hindcast_output(cfg, scenario).hash}, exclude={"evaluation": ["significance"]})
 
 
 def lead_window_change(hc: xr.DataArray, windows, reference_length: int) -> xr.DataArray:
@@ -102,7 +102,7 @@ def _continuous_one(product, name, lead, verification, Nyr, n_boot, seed, smooth
 
 
 def continuous_evaluation(cfg, products, verification, leads_eval) -> xr.Dataset:
-    ncfg = cfg["evaluation"]["nao_continuous"]
+    ncfg = cfg["evaluation"]["index_continuous"]
     Nyr = ncfg["running_mean"]
     boot = cfg["evaluation"]["bootstrap"]
     smoothed = {}
@@ -131,7 +131,7 @@ def hindcast_overview(cfg, products, internal_full, name) -> xr.Dataset:
     ensemble mean of the analogue hindcast (init_year, lead), smoothed like the continuous evaluation,
     and the observed internal index with the same centred running mean (visual verification)
     """
-    Nyr = cfg["evaluation"]["nao_continuous"]["running_mean"]
+    Nyr = cfg["evaluation"]["index_continuous"]["running_mean"]
     analogue = products["analogue"].rolling(lead=Nyr, center=True).mean().mean("member")
     observed = running_mean(internal_full.values, Nyr, Nyr)[0]
     ds = xr.Dataset({
@@ -177,7 +177,7 @@ def window_evaluation(cfg, products, obs_change, windows) -> xr.Dataset:
 
 def synthetic_null(cfg, synth: xr.Dataset, windows, leads_eval) -> xr.Dataset:
     """95th percentile over the synthetic series of the continuous and window skill"""
-    Nyr = cfg["evaluation"]["nao_continuous"]["running_mean"]
+    Nyr = cfg["evaluation"]["index_continuous"]["running_mean"]
     ref_len = cfg["target"]["reference_length"]
     mean = synth["mean"]
     inits = mean.init_year.values
@@ -212,7 +212,7 @@ def run_scenario(cfg, scenario):
     products = build_products(cfg, scenario, split, leads)
     inits = products["analogue"].init_year.values
 
-    ncfg = cfg["evaluation"]["nao_continuous"]
+    ncfg = cfg["evaluation"]["index_continuous"]
     leads_eval = np.arange(ncfg["lead_times"][0], ncfg["lead_times"][1] + 1)
     internal_full = series - fc.forced_part(design, split.obs_coef(name, "coef_full"))
     verification = obs_running_verification(internal_full, inits, leads, ncfg["running_mean"])
@@ -229,7 +229,7 @@ def run_scenario(cfg, scenario):
     if hc_out.exists("synthetic.nc") and not out.exists("null.nc"):
         write_netcdf(synthetic_null(cfg, open_hindcast(cfg, scenario, "synthetic.nc"), windows, leads_eval), out.path("null.nc"), cfg)
 
-    from climate_scenarios_2050.plotting.nao import plot_evaluation
+    from climate_scenarios_2050.plotting.index import plot_evaluation
     plot_evaluation(cfg, out, scenario)
     return out
 

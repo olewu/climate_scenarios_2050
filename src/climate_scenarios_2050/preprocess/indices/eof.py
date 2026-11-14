@@ -1,5 +1,9 @@
 """
-EOF-based indices (NAO = mode 1 of DJFM SLP over the North Atlantic, East Atlantic pattern = mode 2, ...).
+EOF-based indices (NAO = mode 1 of DJFM SLP over the North Atlantic, East Atlantic pattern = mode 2,
+PDO = mode 1 of annual North Pacific SST minus the global mean, ...).
+
+Grid points without data in all samples (land in SST fields) are left out everywhere: they do not
+discard samples, the pattern is NaN there and the projection ignores them.
 
 Pattern
 -------
@@ -37,8 +41,13 @@ def coslat_weights(lat: xr.DataArray) -> xr.DataArray:
     return np.sqrt(np.cos(np.deg2rad(lat))).clip(min=0)
 
 
+def _detrend_finite(x: np.ndarray) -> np.ndarray:
+    """linear detrend of a series; NaN if it has missing values (e.g. land points in SST)"""
+    return detrend(x) if np.isfinite(x).all() else np.full_like(x, np.nan)
+
+
 def _detrend_year(da: xr.DataArray) -> xr.DataArray:
-    return xr.apply_ufunc(detrend, da, input_core_dims=[["year"]], output_core_dims=[["year"]], vectorize=True)
+    return xr.apply_ufunc(_detrend_finite, da, input_core_dims=[["year"]], output_core_dims=[["year"]], vectorize=True)
 
 
 def fit_pattern(field: xr.DataArray, normal_period, n_modes: int = 10, detrend_fit: bool = True, sign_point: dict = None, source: str = "") -> xr.Dataset:
@@ -49,16 +58,18 @@ def fit_pattern(field: xr.DataArray, normal_period, n_modes: int = 10, detrend_f
     sub = field.sel(year=slice(*normal_period))
     sample_dims = [d for d in ["member", "year"] if d in sub.dims]
     if "member" in sub.dims:
-        # drop member-years without data (e.g. members starting after the normal period begins)
+        # drop member-years without data (e.g. members starting after the normal period begins);
+        # points without data in any sample (land) do not count
         stacked = sub.stack(sample=sample_dims)
-        valid = stacked.notnull().all(["lat", "lon"])
+        static = stacked.isnull().all("sample")
+        valid = (stacked.notnull() | static).all(["lat", "lon"])
         clim = stacked.isel(sample=valid.values).mean("sample")
         anom = sub - clim
         if detrend_fit:
             # detrend each member over its available years
             anom = xr.concat([_detrend_year(anom.sel(member=m).dropna("year", how="all")).reindex(year=anom.year) for m in anom.member.values], dim="member")
         anom = anom.stack(sample=sample_dims)
-        anom = anom.isel(sample=anom.notnull().all(["lat", "lon"]).values)
+        anom = anom.isel(sample=(anom.notnull() | static).all(["lat", "lon"]).values)
         years_used = np.unique(anom["year"].values)
     else:
         clim = sub.mean("year")
@@ -138,7 +149,8 @@ def normal_period_climatology(field: xr.DataArray, normal_period) -> xr.DataArra
     sub = field.sel(year=slice(*normal_period))
     if "member" not in sub.dims:
         return sub.mean("year")
-    full = sub.notnull().all(["year", "lat", "lon"])
+    # a member covers the period if it has data in every year at all points it ever has data (land excluded)
+    full = (sub.notnull() | sub.isnull().all("year")).all(["year", "lat", "lon"]) & sub.notnull().any(["year", "lat", "lon"])
     if bool(full.any()):
         return sub.sel(member=full.values).mean(["member", "year"])
     log.warning("no member covers the full normal period, using all available member-years")
@@ -150,5 +162,10 @@ def project(field: xr.DataArray, pattern: xr.Dataset, mode: int, climatology: xr
     comp = pattern["components"].sel(mode=mode)
     weights = coslat_weights(comp["lat"])
     anom = field - climatology
-    score = (anom * weights * comp).sum(["lat", "lon"], skipna=False)
+    # points outside the pattern (land) are ignored; points a dataset never has (e.g. a slightly different
+    # land-sea mask) count as zero anomaly; a missing value in a single year still gives NaN for that year
+    on_pattern = comp.notnull()
+    never = anom.isnull().all("year")
+    anom = anom.where(~never, 0.0).where(on_pattern, 0.0)
+    score = (anom * weights * comp.fillna(0.0)).sum(["lat", "lon"], skipna=False)
     return ((score - pattern["score_mean"].sel(mode=mode)) / pattern["score_std"].sel(mode=mode)).rename("index")

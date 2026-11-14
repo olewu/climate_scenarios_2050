@@ -1,0 +1,29 @@
+# South America with the Pacific Decadal Oscillation (PDO) as predictor - template, not runnable yet:
+# - needs CMIP6 tos (Omon) in the archive (download: add tos to download.variables)
+# - with ERA5 SST alone (from 1940) a 70-year matching window leaves no useful hindcast inits; add a long
+#   SST reconstruction (e.g. DCENT) to obs_sources and paths.inputs, list it in predictor.obs_datasets
+#   and merge it with ERA5 (obs.merge), as HadSLP/ERA5 for the NAO
+region:
+  name: south_america
+  domain: {lon: [-85, -30], lat: [-60, 15]}
+  targets: [tas, pr, ws10]             # no GWA-scaled wind outside Europe: ERA5 10 m wind speed
+  sites: {}
+
+predictor:
+  name: pdo
+  method: eof
+  variable: tos
+  aggregation: annual
+  domain: {lon: [110, -100], lat: [20, 70]}   # North Pacific poleward of 20N, crosses the date line
+  mode: 1
+  pattern_source: ERA5
+  obs_datasets: [ERA5]
+  remove_global_mean: true             # PDO: EOF of SST anomalies minus the global-mean SST anomaly
+  sign_reference_point: {lat: 45.75, lon: -130.25}   # positive PDO: warm along the North American west coast
+  reference_skill: null
+
+obs:
+  matching_index: ERA5
+  training_index: ERA5
+  merge: null                          # e.g. {datasets: [DCENT, ERA5], year: 1980, harmonization_period: [1940, 2018]}
+  target_variable: tas

@@ -13,7 +13,8 @@ pressure level, a latitude band) is read through OPeNDAP and written as
 `<experiment>/<model>/<variable>_<tag>/<file name without .nc>_<tag>.nc`. There is no checksum for a
 subset; instead every month of the file's range must be present and no time step may be empty.
 
-Every attempt is appended to `<inventory>/download_log.jsonl`; a rerun skips files already in place.
+Every file is appended to `<inventory>/download_log.jsonl` as soon as it is done; a rerun skips files
+already in place.
 """
 
 import hashlib
@@ -21,7 +22,9 @@ import json
 import logging
 import os
 import shutil
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import functools
+import threading
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -31,6 +34,7 @@ import requests
 import xarray as xr
 
 from climate_scenarios_2050.cmip_retrieval import esgf
+from climate_scenarios_2050.core.config import cmip6_table
 from climate_scenarios_2050.cmip_retrieval.inventory import FILE_PATTERN, latest_inventory_dir, subset_dir, subset_file
 
 log = logging.getLogger(__name__)
@@ -225,11 +229,26 @@ def run(cfg, target=None, inventory=None, variables=None, experiments=None, max_
 
     period = cfg["cmip6"]["period"]
     results = []
+    lock = threading.Lock()
+
+    def finished(job, base):
+        """log every file as soon as it is done (also if the run is interrupted later)"""
+        try:
+            record = {**base, **job.result()}
+        except Exception as exc:
+            record = {**base, "status": "failed", "error": repr(exc)}
+        with lock:
+            _log(log_file, record)
+            results.append(record)
+            if len(results) % 200 == 0:
+                log.info(f"{len(results)} files done")
+        if record["status"] == "failed":
+            log.warning(f"failed: {record.get('file', record['dataset_id'])}: {record['error'][:300]}")
+
     with ProcessPoolExecutor(dcfg["workers"]) as pool:
-        jobs = {}
         for _, row in todo.iterrows():
             try:
-                files = dataset_files(row, dcfg["index_nodes"], dcfg["table"], opendap=row["variable"] in subsets)
+                files = dataset_files(row, dcfg["index_nodes"], cmip6_table(cfg, row["variable"]), opendap=row["variable"] in subsets)
             except Exception as exc:
                 files, error = [], repr(exc)
             else:
@@ -237,8 +256,9 @@ def run(cfg, target=None, inventory=None, variables=None, experiments=None, max_
             base = {"dataset_id": row["dataset_id"], "variable": row["variable"], "experiment": row["experiment"], "model": row["model"], "member": row["member"]}
             if not files:
                 record = {**base, "status": "failed", "error": error}
-                _log(log_file, record)
-                results.append(record)
+                with lock:
+                    _log(log_file, record)
+                    results.append(record)
                 continue
             for file in files:
                 if not in_period(file["name"], period):
@@ -247,19 +267,12 @@ def run(cfg, target=None, inventory=None, variables=None, experiments=None, max_
                 if row["variable"] in subsets:
                     spec = subsets[row["variable"]]
                     destination = folder / subset_dir(row["variable"], spec["tag"]) / subset_file(file["name"], spec["tag"])
-                    jobs[pool.submit(fetch_subset, file, destination, partial_dir, row["variable"], spec)] = base
+                    job = pool.submit(fetch_subset, file, destination, partial_dir, row["variable"], spec)
                 else:
                     destination = folder / row["variable"] / file["name"]
-                    jobs[pool.submit(fetch, file, destination, partial_dir)] = base
-        for job in as_completed(jobs):
-            try:
-                record = {**jobs[job], **job.result()}
-            except Exception as exc:
-                record = {**jobs[job], "status": "failed", "error": repr(exc)}
-            _log(log_file, record)
-            results.append(record)
-            if record["status"] == "failed":
-                log.warning(f"failed: {record.get('file', record['dataset_id'])}: {record['error'][:300]}")
+                    job = pool.submit(fetch, file, destination, partial_dir)
+                job.add_done_callback(functools.partial(finished, base=base))
+        # leaving the block waits for all files
 
     df = pd.DataFrame(results)
     if not df.empty:

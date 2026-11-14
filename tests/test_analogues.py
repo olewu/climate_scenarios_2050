@@ -2,7 +2,7 @@ import numpy as np
 import xarray as xr
 
 from climate_scenarios_2050.analogues import matching
-from climate_scenarios_2050.baselines import nao as baselines
+from climate_scenarios_2050.baselines import index as baselines
 from climate_scenarios_2050.evaluate import metrics
 
 CFG = {

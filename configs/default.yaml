@@ -11,10 +11,53 @@ cmip6:
   scenarios_hindcast: [ssp245, ssp370]                   # scenarios used for hindcast evaluation
   period: [1850, 2100]    # calendar years read from historical + scenario runs
   weighting: model        # model: every model counts once | member: every member counts once
+  min_scenario_end: 2054  # scenario runs ending earlier (e.g. 2015-2020 extensions) are neither downloaded nor used; 2054: keeps the short AerChemMIP-type ssp370 runs to 2054/2055
+  tables: {tos: Omon}     # CMIP6 table of a variable if not Amon (download and preprocessing)
+
+#---------------region and prediction targets--------------#
+# Domains: {lon: [west, east], lat: [south, north]}; west > east crosses the date line (e.g. [110, -100]).
+region:
+  name: europe
+  domain: {lon: [-35, 45], lat: [25, 75]}
+  targets: [wsp100, energy, tas, pr]   # active targets (keys of `targets`)
+  sites:                               # site tables and figures
+    UtsiraNord: {lat: 59.25, lon: 4.54}
+    CelticSea: {lat: 51.75, lon: -6.24}
+    NorfolkBoreas: {lat: 53.08, lon: 2.82}
+    NorthernSpain: {lat: 44.03, lon: -8.63}
+    Smola: {lat: 63.47, lon: 6.45}
+    NISA: {lat: 53.70, lon: -5.86}
+    SorligeNordsjo2: {lat: 56.83, lon: 5.04}
+
+# Prediction targets: annual means of monthly observations, cut to the region on their own grid.
+#   source: file (a prepared file, `file` = key of paths.inputs.targets, `variable` = name in the file) or
+#           a dataset of `obs_sources` (`variable` = CMIP6 name of the variable there)
+#   cmip6:  CMIP6 variable of the M2a/M3a methods and the CMIP6 forced estimate (null: none)
+#   change: relative (%) | absolute (units of the target)
+targets:
+  wsp100: {source: file, file: wsp100, variable: wsp100, cmip6: sfcWind, change: relative}   # GWA-scaled 100 m wind, Europe only
+  energy: {source: file, file: energy, variable: energy, cmip6: null, change: relative}      # wind energy of one turbine type, Europe only
+  tas: {source: ERA5, variable: tas, cmip6: tas, change: absolute}
+  pr: {source: ERA5, variable: pr, cmip6: pr, change: relative}
+  ws10: {source: ERA5, variable: sfcWind, cmip6: sfcWind, change: relative}                  # 10 m wind speed, any region
+
+# How the observational datasets are read: per variable the name in the files and the conversion to CMIP6
+# units (value * factor + offset). era5_monthly: one file per month in paths.inputs.era5_monthly/<folder>/;
+# file: one file, `path` = key of paths.inputs.
+obs_sources:
+  ERA5:
+    kind: era5_monthly
+    variables:
+      psl: {folder: mean_sea_level_pressure, name: msl}
+      tas: {folder: 2m_temperature, name: t2m}
+      pr: {folder: total_precipitation, name: tp, factor: 0.0115740741}   # m/day -> kg m-2 s-1
+      sfcWind: {folder: 10m_wind_speed, name: si10}
+      tos: {folder: sea_surface_temperature, name: sst, offset: -273.15}  # K -> degC
+  HadSLP: {kind: file, path: hadslp, variables: {psl: {name: slp, factor: 100.0}}}   # hPa -> Pa
+  20CR: {kind: file, path: 20cr, variables: {psl: {name: prmsl}}}
 
 #---------------step 0: CMIP6 download (not hashed; `pixi run cmip6-inventory`, `pixi run cmip6-download`)--------------#
 download:
-  table: Amon
   variables: [psl, sfcWind, tas, pr, ua]
   experiments: [historical, ssp119, ssp126, ssp245, ssp370, ssp585]
   index_nodes: [ceda, dkrz, ornl]      # searched in this order; the inventory uses all of them
@@ -28,6 +71,11 @@ preprocess:
   grid_spacing: 1.5       # global regular grid, cell centres at +-0.75, ..., lon -179.25 ... 179.25
   overwrite: false        # replace existing regridded archives
   keep_monthly: false     # also store regridded monthly fields (large)
+  # CMIP6 fields; only those of the predictor and of the active targets are processed. An entry is named
+  # after its CMIP6 variable unless `variable` is given (e.g. tas_np: {variable: tas, ...} next to tas).
+  # domain: region = the domain of `region`. global_mean: true | ocean - also store the area-weighted
+  # global mean (`<variable>_global_mean`, over the ocean only for `ocean`, mask from ERA5 SST), needed
+  # for `predictor.remove_global_mean`
   fields:
     psl:
       method: bilinear
@@ -36,13 +84,26 @@ preprocess:
     sfcWind:
       method: bilinear
       aggregations: {annual: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], DJF: [12, 1, 2], JJA: [6, 7, 8]}
-      domain: {lon: [-35, 45], lat: [25, 75]}
-  obs_datasets: [ERA5, HadSLP, 20CR]
+      domain: region
+    tas:
+      method: bilinear
+      aggregations: {annual: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]}
+      domain: region
+    pr:
+      method: bilinear
+      aggregations: {annual: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]}
+      domain: region
+    tos:
+      method: bilinear
+      aggregations: {annual: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]}
+      domain: {lon: [100, -80], lat: [0, 75]}   # North Pacific, crosses the date line
+      global_mean: true
 
 predictor:
   name: nao
   method: eof             # eof | box (station-based) | jet, amv (not implemented yet)
   variable: psl
+  field: null                          # entry of preprocess.fields (null: the variable's own entry)
   aggregation: DJFM
   domain: {lon: [-90, 40], lat: [20, 80]}
   mode: 1
@@ -52,15 +113,19 @@ predictor:
   n_modes: 10
   sign_reference_point: {lat: 35.25, lon: -20.25}   # positive pattern value here (Azores high for NAO+)
   box: null                            # for method: box, e.g. {south: {...}, north: {...}}
+  obs_datasets: [ERA5, HadSLP, 20CR]   # observational datasets the index is computed for (keys of obs_sources)
+  remove_global_mean: false            # subtract the global-mean field before the EOF/projection (e.g. PDO with SST)
+  mask: null                           # null | ocean: restrict the index field to the ocean (mask from ERA5 SST)
+  reference_skill: {lead: 5.5, low: 0.57, high: 0.79, label: DCPP (LY2-9)}   # marker in the skill figure (null: none)
 
 obs:
-  matching_index: merged               # merged | ERA5 | HadSLP | 20CR
+  matching_index: merged               # merged | one of predictor.obs_datasets
   merge:
     datasets: [HadSLP, ERA5]           # [early, late]
     year: 1980                         # first season taken from the late dataset
     harmonization_period: [1940, 2018] # overlap used to rescale the late to the early dataset (frozen)
-  training_index: ERA5                 # index used for the linear model (consistent with the wind data)
-  wind_variable: wsp100                # wsp100 | energy
+  training_index: ERA5                 # index used for the linear model (consistent with the target data)
+  target_variable: wsp100              # default target of the forecast step (one of region.targets)
 
 #---------------step 2: forced/internal split--------------#
 split:
@@ -104,36 +169,27 @@ baselines:
 target:
   windows: [[1, 5], [6, 10], [11, 15], [16, 20], [21, 25], [26, 30], [1, 10], [11, 20], [21, 30], [1, 20], [11, 30]]
   reference_length: 20
-  predictor_lag: 1                     # season t-1 predicts wind in year t
-  change: relative                     # relative (%) | absolute
+  predictor_lag: 1                     # season t-1 predicts the target in year t (change type: per target)
 
 #---------------step 4: linear model--------------#
 linear_model:
   leave_out: overlap_target            # exclude training windows overlapping the target window
   min_samples: 20                      # no fit with fewer (overlapping) training windows
 
-#---------------step 5/6: wind methods--------------#
-forced_wind: nao_mmem                  # nao_mmem (a) | cmip6_sfcwind (b) | none (c)
+#---------------step 5/6: target methods--------------#
+forced_target: index_mmem              # forced part of M0/M2b/M3b: index_mmem (a) | cmip6_mmem (b, needs a CMIP6 variable) | none (c)
 
 evaluation:
   quantiles: [0.5, 0.9]
   bootstrap: {n: 1000, method: moving_block, seed: 12345}
-  nao_continuous: {running_mean: 8, lead_times: [1, 33]}
-  significance:                        # wind skill maps: skill beyond M0 against phase-randomized surrogates
+  index_continuous: {running_mean: 8, lead_times: [1, 33]}
+  significance:                        # target skill maps: skill beyond M0 against phase-randomized surrogates
     enabled: true
     n: 1000                            # surrogates
     seed: 2026
     alpha: 0.05                        # global level; FDR at q = fdr_factor * alpha (Wilks 2016)
     fdr_factor: 2
     chunk_points: 500                  # grid points per parallel job (memory)
-  sites:
-    UtsiraNord: {lat: 59.25, lon: 4.54}
-    CelticSea: {lat: 51.75, lon: -6.24}
-    NorfolkBoreas: {lat: 53.08, lon: 2.82}
-    NorthernSpain: {lat: 44.03, lon: -8.63}
-    Smola: {lat: 63.47, lon: 6.45}
-    NISA: {lat: 53.70, lon: -5.86}
-    SorligeNordsjo2: {lat: 56.83, lon: 5.04}
 
 #---------------step 7: yearly update of the index--------------#
 update:

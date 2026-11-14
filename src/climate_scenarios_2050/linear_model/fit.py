@@ -27,16 +27,16 @@ from climate_scenarios_2050.core.timeconv import window_label
 from climate_scenarios_2050.preprocess import obs
 from climate_scenarios_2050.preprocess.indices.compute import open_obs_index
 from climate_scenarios_2050.split import forced as fc
-from climate_scenarios_2050.split.run import SplitResults, available_wind_variables, split_output
+from climate_scenarios_2050.split.run import SplitResults, available_target_variables, split_output
 
 log = logging.getLogger(__name__)
 
 
-def linear_model_output(cfg, scenario: str, wind_variable: str) -> StepOutput:
+def linear_model_output(cfg, scenario: str, target_variable: str) -> StepOutput:
     return StepOutput(
         cfg, "linear_model", sections=["linear_model", "target"],
-        extra={"scenario": scenario, "wind_variable": wind_variable, "training_index": cfg["obs"]["training_index"]},
-        upstream={"split": split_output(cfg, scenario).hash, "obs_wind": obs.wind_output(cfg, wind_variable).hash},
+        extra={"scenario": scenario, "target_variable": target_variable, "training_index": cfg["obs"]["training_index"]},
+        upstream={"split": split_output(cfg, scenario).hash, "obs_target": obs.target_output(cfg, target_variable).hash},
     )
 
 
@@ -82,15 +82,15 @@ def fit_case(index_internal: np.ndarray, wind_internal: np.ndarray, length: int,
 class Training:
     """observed series and split of one scenario, paired for training"""
 
-    def __init__(self, cfg, scenario: str, wind_variable: str):
+    def __init__(self, cfg, scenario: str, target_variable: str):
         self.split = SplitResults(cfg, scenario)
         self.lag = cfg["target"]["predictor_lag"]
         self.ref = cfg["target"]["reference_length"]
         self.min_samples = cfg["linear_model"]["min_samples"]
         self.index_name = cfg["obs"]["training_index"]
-        self.wind_variable = wind_variable
+        self.target_variable = target_variable
         index = open_obs_index(cfg, self.index_name).dropna("year")
-        wind = obs.open_obs_wind(cfg, wind_variable)
+        wind = obs.open_obs_target(cfg, target_variable)
         # pair wind of year t with the season t - lag
         years = np.intersect1d(wind.year.values, index.year.values + self.lag)
         self.years = years
@@ -100,7 +100,7 @@ class Training:
         self.wind_values = self.wind_raw.values.reshape(len(years), -1)
         self.index_raw = index.sel(year=years - self.lag)
         self.index_design = fc.design_matrix(self.split.basis, self.index_raw.year.values).values
-        self.wind_design = self.split.wind_design(years).values
+        self.wind_design = self.split.target_design(years).values
 
     def internal(self, index_coef: np.ndarray, wind_coef: np.ndarray):
         """internal index (years) and wind (years, points) for coefficients of one case"""
@@ -120,10 +120,10 @@ def hindcast_parameters(cfg, training: Training) -> xr.Dataset:
     windows = [tuple(w) for w in cfg["target"]["windows"]]
     labels = [window_label(w) for w in windows]
     full_period = cfg["split"]["obs_leakage"] == "full_period"
-    split, name, var = training.split, training.index_name, training.wind_variable
+    split, name, var = training.split, training.index_name, training.target_variable
     lag = training.lag
     index_case = split.obs_coef(name, "coef_full" if full_period else f"coef_window_lag{lag}")
-    wind_case = split.wind_coef(var, "coef_full" if full_period else "coef_window").load()
+    wind_case = split.target_coef(var, "coef_full" if full_period else "coef_window").load()
     if full_period:
         all_inits = training.years
     else:
@@ -175,9 +175,9 @@ def hindcast_parameters(cfg, training: Training) -> xr.Dataset:
 def forecast_parameters(cfg, training: Training) -> xr.Dataset:
     """one fit per (init_year, window length), using only data up to the init year"""
     lengths = sorted({w[1] - w[0] + 1 for w in cfg["target"]["windows"]})
-    split, name, var = training.split, training.index_name, training.wind_variable
+    split, name, var = training.split, training.index_name, training.target_variable
     index_case = split.obs_coef(name, "coef_up_to_init")
-    wind_case = split.wind_coef(var, "coef_up_to_init").load()
+    wind_case = split.target_coef(var, "coef_up_to_init").load()
     years = training.years
     inits = np.intersect1d(np.intersect1d(index_case.init_year.values, wind_case.init_year.values), years)
     shape = (len(inits), len(lengths), training.n_points)
@@ -222,10 +222,10 @@ def perfect_index_skill(params: xr.Dataset) -> xr.Dataset:
 
 def run_scenario(cfg, scenario: str):
     hindcast_scenario = scenario in cfg["cmip6"]["scenarios_hindcast"]
-    for wind_variable in available_wind_variables(cfg):
-        out = linear_model_output(cfg, scenario, wind_variable).prepare()
-        log.info(f"linear model {scenario} {wind_variable} -> {out.dir}")
-        training = Training(cfg, scenario, wind_variable)
+    for target_variable in available_target_variables(cfg):
+        out = linear_model_output(cfg, scenario, target_variable).prepare()
+        log.info(f"linear model {scenario} {target_variable} -> {out.dir}")
+        training = Training(cfg, scenario, target_variable)
         if hindcast_scenario and not out.exists("hindcast.nc"):
             write_netcdf(hindcast_parameters(cfg, training), out.path("hindcast.nc"), cfg, compress=True)
         if hindcast_scenario and not out.exists("perfect_index_skill.nc"):
@@ -235,7 +235,7 @@ def run_scenario(cfg, scenario: str):
             write_netcdf(forecast_parameters(cfg, training), out.path("forecast.nc"), cfg, compress=True)
         if hindcast_scenario:
             from climate_scenarios_2050.plotting.linear_model import plot_linear_model
-            plot_linear_model(cfg, out, scenario, wind_variable)
+            plot_linear_model(cfg, out, scenario, target_variable)
 
 
 def run(cfg, scenarios=None):
