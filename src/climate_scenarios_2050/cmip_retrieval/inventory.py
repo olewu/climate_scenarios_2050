@@ -134,21 +134,21 @@ def local_datasets(root, variables, experiments, tables=None, subsets=None) -> p
     return out
 
 
-def is_short(df: pd.DataFrame, min_scenario_end) -> pd.Series:
-    """scenario runs ending before min_scenario_end (unknown end: not short)"""
-    return (df["experiment"] != "historical") & df["end"].notna() & (df["end"] < min_scenario_end)
+def is_short(df: pd.DataFrame, scenario_end) -> pd.Series:
+    """scenario runs ending before scenario_end (unknown end: not short)"""
+    return (df["experiment"] != "historical") & df["end"].notna() & (df["end"] < scenario_end)
 
 
-def plan(remote: pd.DataFrame, local: pd.DataFrame, scenarios, prefer_grid="gn", min_scenario_end=2099) -> pd.DataFrame:
+def plan(remote: pd.DataFrame, local: pd.DataFrame, scenarios, prefer_grid="gn", scenario_end=2055) -> pd.DataFrame:
     """
     one row per (variable, experiment, model, member) of usable members, with `status`
     local | download | missing | short, and the grid and size of the dataset to download.
-    Scenario runs ending before `min_scenario_end` (e.g. CNRM-CM6-1 ssp245 r7-r10, 2015-2020) are
+    Scenario runs ending before `scenario_end` (e.g. CNRM-CM6-1 ssp245 r7-r10, 2015-2020) are
     `short`: not downloaded, and they do not make a member usable.
     """
     members = ["variable", "model", "member"]
-    remote_ok = remote[~is_short(remote, min_scenario_end)]
-    local_ok = local[~is_short(local, min_scenario_end)]
+    remote_ok = remote[~is_short(remote, scenario_end)]
+    local_ok = local[~is_short(local, scenario_end)]
     available = pd.concat([remote_ok[[*members, "experiment"]], local_ok[[*members, "experiment"]]]).drop_duplicates()
     has = available.assign(flag=True).pivot_table(index=members, columns="experiment", values="flag", aggfunc="any", fill_value=False)
     for exp in ["historical", *scenarios]:
@@ -164,17 +164,17 @@ def plan(remote: pd.DataFrame, local: pd.DataFrame, scenarios, prefer_grid="gn",
             row = {"variable": key[0], "experiment": exp, "model": key[1], "member": key[2]}
             here = local[(local["variable"] == key[0]) & (local["model"] == key[1]) & (local["member"] == key[2]) & (local["experiment"] == exp)]
             if not here.empty:
-                short = bool(is_short(here, min_scenario_end).all())
+                short = bool(is_short(here, scenario_end).all())
                 rows.append({**row, "status": "short" if short else "local", "grid": here["grid"].iloc[0], "size": int(here["size"].sum()), "end": here["end"].max()})
                 continue
             offered = remote[(remote["variable"] == key[0]) & (remote["model"] == key[1]) & (remote["member"] == key[2]) & (remote["experiment"] == exp)]
             if offered.empty:
                 rows.append({**row, "status": "missing", "grid": None, "size": 0})
                 continue
-            if is_short(offered, min_scenario_end).all():
+            if is_short(offered, scenario_end).all():
                 rows.append({**row, "status": "short", "grid": None, "size": 0, "end": offered["end"].max()})
                 continue
-            offered = offered[~is_short(offered, min_scenario_end)]
+            offered = offered[~is_short(offered, scenario_end)]
             grids = list(offered["grid"])
             grid, note = local_grid.get(key), ""
             if grid not in grids:
@@ -225,7 +225,7 @@ def run(cfg, variables=None, experiments=None) -> Path:
         log.warning(f"{len(failures)} queries failed on at least one index node, see {out / 'failed_queries.csv'}")
     local = local_datasets(cfg["paths"]["inputs"]["cmip6"], variables, experiments, tables, dcfg.get("subsets"))
     local.to_csv(out / "local.csv", index=False)
-    planned = plan(remote, local, scenarios, dcfg["prefer_grid"], cfg["cmip6"]["min_scenario_end"])
+    planned = plan(remote, local, scenarios, dcfg["prefer_grid"], cfg["cmip6"]["full_period"][1])
     planned.to_csv(out / "plan.csv", index=False)
     table = summary(planned, local, dcfg.get("subsets"))
     table.to_csv(out / "summary.csv")

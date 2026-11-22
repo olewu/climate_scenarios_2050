@@ -161,9 +161,13 @@ predictor or of `obs`: the HadSLP/ERA5 merge (`obs.merge`, null to switch off), 
   months weighted by their length in each model's own calendar, then calendar dropped; then
   regrid (bilinear for psl/sfcWind/tas, conservative for pr) to a global 1.5° grid, weights
   cached per source grid. Monthly regridded output optional (off by default).
-- Members with gaps inside their monthly series are dropped and logged (no filling). Members that
-  start later (e.g. EC-Earth3 r101+ from 1970) are kept with NaN before their start; each later step
-  requires complete data only for the years it actually uses (e.g. the matching window).
+- Only members whose historical + scenario files cover every month of `cmip6.full_period`
+  (1850-2055) by their file names are used; late historical starts (EC-Earth3 r101+ from 1970, GISS
+  r30x from 1990) and short scenario runs are left out. The variables of `cmip6.common_members`
+  (psl, pr, sfcWind, tas, ua) use only the members complete in all of them, so the predictor and all
+  target fields share one member list per scenario (2026-11-22: ssp119 204 members / 17 models, ssp126
+  292/43, ssp245 417/44, ssp370 417/43, ssp585 358/48). Members with gaps in the data read are dropped
+  and logged as well (no filling).
 - Historical runs are used until Dec 2014, scenario runs from Jan 2015 (some historical files
   extend beyond 2014, e.g. FGOALS-g3).
 - Output: `/datalake/NS9873K/DATA/CMIP6/processed/` (currently empty).
@@ -173,7 +177,7 @@ predictor or of `obs`: the HadSLP/ERA5 merge (`obs.merge`, null to switch off), 
   Downstream, the member list enters per scenario: the CMIP6 indices have their own output per
   scenario (`indices_cmip6/<hash>/`, separate from the observed indices in `indices/<hash>/`); the
   split of a scenario depends on that scenario's predictor members, and each target's hindcast inputs
-  on the members of its CMIP6 variable. A download for one scenario or one target variable therefore
+  on the members of its CMIP6 variable. A download for one scenario or one target variable (outside `cmip6.common_members`) therefore
   leaves the other hashes unchanged. Run the preprocessing after
   a download has finished, not while files are still arriving.
 

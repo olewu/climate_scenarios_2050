@@ -11,7 +11,9 @@ cmip6:
   scenarios_hindcast: [ssp245, ssp370]                   # scenarios used for hindcast evaluation
   period: [1850, 2100]    # calendar years read from historical + scenario runs
   weighting: model        # model: every model counts once | member: every member counts once
-  min_scenario_end: 2054  # scenario runs ending earlier (e.g. 2015-2020 extensions) are neither downloaded nor used; 2054: keeps the short AerChemMIP-type ssp370 runs to 2054/2055
+  full_period: [1850, 2055]   # members must cover every month of these years (historical + scenario, by the file names);
+                              # drops late historical starts (EC-Earth3 r101+ from 1970) and short scenario runs (not downloaded either)
+  common_members: [psl, pr, sfcWind, tas, ua]   # these variables use only the members complete in all of them (null: per variable)
   tables: {tos: Omon}     # CMIP6 table of a variable if not Amon (download and preprocessing)
 
 #---------------region and prediction targets--------------#
@@ -63,6 +65,10 @@ download:
   index_nodes: [ceda, dkrz, ornl]      # searched in this order; the inventory uses all of them
   prefer_grid: gn                      # grid of new members (members already in the archive keep theirs)
   workers: 4                           # parallel file downloads
+  skip_host_after: 5                   # connection failures in a row after which a server is paused ...
+  skip_host_minutes: 15                # ... for this long, then probed again
+  deferred_rounds: 8                   # files of paused servers: retried after each pause, at most this often
+  min_request_interval: 1.0            # seconds between two requests to the same server (rate limits)
   subsets:                             # variables read as a subset through OPeNDAP, stored as <variable>_<tag>
     ua: {plev: 85000, lat: [10, 80], tag: plev850_lat10-80}
 

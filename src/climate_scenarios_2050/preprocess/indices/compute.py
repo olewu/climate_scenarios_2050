@@ -103,7 +103,7 @@ class IndexCalculator:
         field = masks.apply(self.cfg, _domain(field, self.pred["domain"]), self.pred.get("mask"))
         clim = eof.normal_period_climatology(field, self.pred["normal_period"])
         if self.pred["method"] == "box":
-            return box.project(field, self.reference, self.pred["box"], clim)
+            return self._attrs(box.project(field, self.reference, self.pred["box"], clim))
         mode = self.pred["mode"]
         pattern = self.reference
         if self.pred["pattern_source"] == "own":
@@ -113,7 +113,15 @@ class IndexCalculator:
             if not fl.exists():
                 write_netcdf(pattern, fl, self.cfg)
             log.info(f"{name}: own mode {int(pattern['own_mode'].sel(mode=mode))} matched (pattern corr {float(pattern['pattern_corr'].sel(mode=mode)):.2f}, fit years {pattern.attrs['fit_years']})")
-        return eof.project(field, pattern, mode, clim)
+        return self._attrs(eof.project(field, pattern, mode, clim))
+
+    def _attrs(self, index: xr.DataArray) -> xr.DataArray:
+        """standardized index: dimensionless, not the units of the field it is computed from"""
+        index.attrs = {"units": "1", "long_name": f"standardized {self.pred['name']} index", "method": self.pred["method"],
+                       "variable": self.pred["variable"], "normal_period": str(list(self.pred["normal_period"]))}
+        if self.pred["method"] == "eof":
+            index.attrs["mode"] = int(self.pred["mode"])
+        return index
 
 
 def merge_indices(early: xr.DataArray, late: xr.DataArray, merge_cfg: dict) -> xr.Dataset:

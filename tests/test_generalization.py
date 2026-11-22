@@ -139,6 +139,7 @@ def fake_cmip6(root, variable, model, variants, exps=("historical", "ssp245")):
     from climate_scenarios_2050.preprocess import cmip6 as c
 
     c._discover_cached.cache_clear()
+    c._common_cached.cache_clear()
     for variant in variants:
         for exp, period in zip(exps, ["185001-201412", "201501-210012"]):
             fl = root / exp / model / variable / f"{variable}_Amon_{model}_{exp}_{variant}_gn_{period}.nc"
@@ -151,6 +152,7 @@ def test_target_downloads_leave_the_predictor_chain_alone(tmp_path):
     from climate_scenarios_2050.split.run import split_output
 
     cfg = small_cfg(tmp_path)
+    cfg["cmip6"]["common_members"] = None   # members per variable (with common members a tas-only member is not used at all)
     archive = tmp_path / "archive"
     for var in ["psl", "tas", "sfcWind"]:
         fake_cmip6(archive, var, "A", ["r1i1p1f1"])
@@ -161,6 +163,12 @@ def test_target_downloads_leave_the_predictor_chain_alone(tmp_path):
     assert after["tas"] != before["tas"]
     fake_cmip6(archive, "psl", "A", ["r2i1p1f1"])     # more psl members: everything downstream changes
     assert split_output(cfg, "ssp245").hash != before["split"]
+    # common members: r2 counts only once it is complete in all listed variables
+    cfg["cmip6"]["common_members"] = ["psl", "tas", "sfcWind"]
+    common_before = split_output(cfg, "ssp245").hash
+    assert common_before == before["split"]
+    fake_cmip6(archive, "sfcWind", "A", ["r2i1p1f1"])
+    assert split_output(cfg, "ssp245").hash != common_before
 
 
 def test_sst_preprocessing_with_global_mean_and_dateline(tmp_path):

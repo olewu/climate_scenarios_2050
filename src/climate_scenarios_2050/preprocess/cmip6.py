@@ -4,8 +4,10 @@ CMIP6 preprocessing: original monthly files -> seasonal/annual means on a common
 For every model and member with both a historical and a scenario run:
 1. historical (until Dec 2014) and scenario (from Jan 2015) monthly data are joined, so seasons
    crossing the boundary (DJFM 2014) are complete
-2. members with gaps inside their covered period are dropped (members starting later, e.g.
-   EC-Earth3 r101+ from 1970, are kept with NaN before their start)
+2. only members whose file names cover every month of `cmip6.full_period` are used (late historical
+   starts such as EC-Earth3 r101+ from 1970 and short scenario runs are left out); for the variables of
+   `cmip6.common_members` only the members complete in all of them, so all fields share one member list.
+   Members with gaps in the data read are dropped as well
 3. seasonal/annual means are computed on the native grid (month lengths of the model's own
    calendar, only complete seasons), restricted to the target domain plus a margin
 4. the means are regridded (xesmf, weights cached per source grid) to the regular global grid,
@@ -124,13 +126,52 @@ def global_mean_mask(cfg, kind, da: xr.DataArray):
 
 #---------------file discovery--------------#
 @functools.lru_cache(maxsize=None)
-def _discover_cached(cmip6_root: str, variable: str, scenario: str, min_scenario_end, table="Amon") -> dict:
-    return discover_members(cmip6_root, variable, scenario, min_scenario_end, table)
+def _discover_cached(cmip6_root: str, variable: str, scenario: str, full_period, table="Amon", folder=None) -> dict:
+    return discover_members(cmip6_root, variable, scenario, full_period, table, folder)
+
+
+def archive_folder(cfg, variable: str) -> str:
+    """folder of a variable in the archive: `<variable>_<tag>` for the subsets of `download.subsets` (e.g. ua)"""
+    tag = ((cfg.get("download") or {}).get("subsets") or {}).get(variable, {}).get("tag")
+    return f"{variable}_{tag}" if tag else variable
+
+
+def _spec(cfg, variable: str) -> tuple:
+    """arguments of `_discover_cached` after the scenario: full period, table, archive folder"""
+    full = cfg["cmip6"].get("full_period")
+    return (tuple(full) if full else None, cmip6_table(cfg, variable), archive_folder(cfg, variable))
+
+
+@functools.lru_cache(maxsize=None)
+def _common_cached(cmip6_root: str, scenario: str, specs: tuple) -> frozenset:
+    """(model, variant) complete in every variable of `specs` ((variable, full period, table, folder)); logs who drops out"""
+    sets = {v: {(model, var) for model, variants in _discover_cached(cmip6_root, v, scenario, *rest).items() for var in variants}
+            for v, *rest in specs}
+    for v in [v for v, found in sets.items() if not found]:
+        log.warning(f"{v} {scenario}: no complete member in the archive, not used for `cmip6.common_members`")
+        del sets[v]
+    if not sets:
+        return frozenset()
+    common = set.intersection(*sets.values())
+    for v, found in sets.items():
+        if found - common:
+            log.info(f"{v} {scenario}: {len(found - common)} members left out, not complete in all of {list(sets)}")
+    return frozenset(common)
 
 
 def members(cfg, variable: str, scenario: str) -> dict:
-    """members in the archive with historical and (long enough) scenario files (scanned once per process)"""
-    return _discover_cached(str(cfg["paths"]["inputs"]["cmip6"]), variable, scenario, cfg["cmip6"].get("min_scenario_end"), cmip6_table(cfg, variable))
+    """
+    members in the archive whose historical and scenario files cover `cmip6.full_period`; for the
+    variables of `cmip6.common_members` only those complete in all of them (scanned once per process)
+    """
+    root = str(cfg["paths"]["inputs"]["cmip6"])
+    own = _discover_cached(root, variable, scenario, *_spec(cfg, variable))
+    common = list(cfg["cmip6"].get("common_members") or [])
+    if variable not in common:
+        return own
+    keep = _common_cached(root, scenario, tuple((v, *_spec(cfg, v)) for v in common))
+    out = {model: {var: files for var, files in variants.items() if (model, var) in keep} for model, variants in own.items()}
+    return {model: variants for model, variants in out.items() if variants}
 
 
 def model_key(variants: dict) -> str:
@@ -153,19 +194,32 @@ def model_store(store: Path, scenario: str, model: str, variants: dict) -> Path:
     return store / scenario / f"{model}_{model_key(variants)}.zarr"
 
 
-END_PATTERN = re.compile(r"_\d{6}-(\d{4})\d{2}\.nc$")
+RANGE_PATTERN = re.compile(r"_(\d{4})(\d{2})-(\d{4})(\d{2})(?:_[^/]+)?\.nc$")
 
 
-def discover_members(cmip6_root, variable: str, scenario: str, min_scenario_end=None, table: str = "Amon") -> dict:
+def _months(files, first_year, last_year) -> set:
+    """months (year * 12 + month - 1) covered by the date ranges in the file names, within the given years"""
+    out = set()
+    for fl in files:
+        m = RANGE_PATTERN.search(Path(fl).name)
+        if m:
+            y0, m0, y1, m1 = map(int, m.groups())
+            out.update(range(max(y0 * 12 + m0 - 1, first_year * 12), min(y1 * 12 + m1 - 1, last_year * 12 + 11) + 1))
+    return out
+
+
+def discover_members(cmip6_root, variable: str, scenario: str, full_period=None, table: str = "Amon", folder: str = None) -> dict:
     """
-    {model: {variant: {"historical": [files], scenario: [files]}}} for all members with
-    both historical and scenario files; members whose scenario run ends before `min_scenario_end`
-    (by the file names, e.g. CNRM-CM6-1 ssp245 r7-r10 ending 2020) are left out
+    {model: {variant: {"historical": [files], scenario: [files]}}} for all members with both historical
+    and scenario files (in `<experiment>/<model>/<folder or variable>/`). With `full_period` (first, last
+    year) the historical files (until 2014) and the scenario files (from 2015) of a member must together
+    cover every month of the period by their file names; other members (late historical starts such as
+    EC-Earth3 r101+ from 1970, short scenario runs, gaps between files) are left out.
     """
     cmip6_root = Path(cmip6_root)
     found = {}
     for exp in ["historical", scenario]:
-        for fl in sorted(cmip6_root.glob(f"{exp}/*/{variable}/{variable}_{table}_*_{exp}_*.nc")):
+        for fl in sorted(cmip6_root.glob(f"{exp}/*/{folder or variable}/{variable}_{table}_*_{exp}_*.nc")):
             if fl.stat().st_size == 0:
                 continue
             model = fl.parent.parent.name
@@ -173,19 +227,23 @@ def discover_members(cmip6_root, variable: str, scenario: str, min_scenario_end=
             if match is None:
                 continue
             found.setdefault(model, {}).setdefault(match.group(1), {}).setdefault(exp, []).append(fl)
-    members, short = {}, []
+    members, incomplete = {}, []
     for model, variants in found.items():
         both = {var: files for var, files in variants.items() if "historical" in files and scenario in files}
-        if min_scenario_end:
+        if full_period:
+            first, last = full_period
+            need = set(range(first * 12, last * 12 + 12))
             for var in list(both):
-                ends = [int(m.group(1)) for m in (END_PATTERN.search(Path(f).name) for f in both[var][scenario]) if m]
-                if ends and max(ends) < min_scenario_end:
-                    short.append(f"{model} {var} (to {max(ends)})")
+                have = _months(both[var]["historical"], first, HIST_END) | _months(both[var][scenario], HIST_END + 1, last)
+                missing = need - have
+                if missing:
+                    incomplete.append(f"{model} {var} (from {min(missing) // 12})")
                     del both[var]
         if both:
             members[model] = dict(sorted(both.items()))
-    if short:
-        log.info(f"{variable} {scenario}: {len(short)} members left out, scenario run ends before {min_scenario_end}: {', '.join(short)}")
+    if incomplete:
+        log.info(f"{variable} {scenario}: {len(incomplete)} members left out, months of {full_period[0]}-{full_period[1]} "
+                 f"missing: {', '.join(incomplete)}")
     return dict(sorted(members.items()))
 
 

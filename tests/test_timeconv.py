@@ -84,6 +84,7 @@ def fake_archive(tmp_path, models, scenario="ssp370"):
     from climate_scenarios_2050.preprocess import cmip6
 
     cmip6._discover_cached.cache_clear()
+    cmip6._common_cached.cache_clear()
     for model, variants in models.items():
         for variant in variants:
             for exp, period in [("historical", "185001-201412"), (scenario, "201501-210012")]:
@@ -97,15 +98,45 @@ def fake_archive(tmp_path, models, scenario="ssp370"):
     }
 
 
-def test_short_scenario_runs_left_out(tmp_path):
+def test_incomplete_members_left_out(tmp_path):
     from climate_scenarios_2050.preprocess import cmip6
 
-    fake_archive(tmp_path, {"A": ["r1i1p1f1", "r2i1p1f1"]})
-    short = tmp_path / "archive" / "ssp370" / "A" / "psl" / "psl_Amon_A_ssp370_r2i1p1f1_gn_201501-210012.nc"
-    short.rename(short.with_name("psl_Amon_A_ssp370_r2i1p1f1_gn_201501-202012.nc"))
-    found = cmip6.discover_members(tmp_path / "archive", "psl", "ssp370", min_scenario_end=2099)
-    assert list(found["A"]) == ["r1i1p1f1"]
-    assert list(cmip6.discover_members(tmp_path / "archive", "psl", "ssp370")["A"]) == ["r1i1p1f1", "r2i1p1f1"]
+    fake_archive(tmp_path, {"A": ["r1i1p1f1", "r2i1p1f1", "r3i1p1f1", "r4i1p1f1", "r5i1p1f1"]})
+    archive = tmp_path / "archive"
+    def move(exp, variant, old, new):
+        fl = archive / exp / "A" / "psl" / f"psl_Amon_A_{exp}_{variant}_gn_{old}.nc"
+        fl.rename(fl.with_name(f"psl_Amon_A_{exp}_{variant}_gn_{new}.nc"))
+    move("ssp370", "r2i1p1f1", "201501-210012", "201501-202012")      # short scenario run
+    move("historical", "r3i1p1f1", "185001-201412", "197001-201412")  # late historical start
+    move("historical", "r4i1p1f1", "185001-201412", "185001-194912")  # gap 1950-2014 ...
+    (archive / "historical" / "A" / "psl" / "psl_Amon_A_historical_r4i1p1f1_gn_195101-201412.nc").write_bytes(b"x")  # ... minus 1951-2014
+    move("ssp370", "r5i1p1f1", "201501-210012", "201501-205512")      # ends exactly at the end of the period: kept
+    found = cmip6.discover_members(archive, "psl", "ssp370", full_period=(1850, 2055))
+    assert list(found["A"]) == ["r1i1p1f1", "r5i1p1f1"]
+    assert len(cmip6.discover_members(archive, "psl", "ssp370")["A"]) == 5
+
+
+def test_common_members_across_variables(tmp_path):
+    from climate_scenarios_2050.preprocess import cmip6
+
+    cfg = fake_archive(tmp_path, {"A": ["r1i1p1f1", "r2i1p1f1"], "B": ["r1i1p1f1"]})
+    cmip6._common_cached.cache_clear()
+    # ua as a subset in its own folder, only for A r1 and B r1
+    for model, variant in [("A", "r1i1p1f1"), ("B", "r1i1p1f1")]:
+        for exp, period in [("historical", "185001-201412"), ("ssp370", "201501-210012")]:
+            fl = tmp_path / "archive" / exp / model / "ua_plev850" / f"ua_Amon_{model}_{exp}_{variant}_gn_{period}_plev850.nc"
+            fl.parent.mkdir(parents=True, exist_ok=True)
+            fl.write_bytes(b"x")
+    cfg["download"] = {"subsets": {"ua": {"tag": "plev850"}}}
+    cfg["cmip6"].update(full_period=[1850, 2055], common_members=None)
+    assert sorted(cmip6.members(cfg, "psl", "ssp370")["A"]) == ["r1i1p1f1", "r2i1p1f1"]
+    cfg["cmip6"]["common_members"] = ["psl", "ua"]
+    assert sorted(cmip6.members(cfg, "psl", "ssp370")["A"]) == ["r1i1p1f1"]
+    assert sorted(cmip6.members(cfg, "ua", "ssp370")) == ["A", "B"]
+    # the member list enters the hash
+    before = cmip6.members_hash(cfg, "psl", "ssp370")
+    cfg["cmip6"]["common_members"] = None
+    assert cmip6.members_hash(cfg, "psl", "ssp370") != before
 
 
 def test_member_list_enters_hash(tmp_path):

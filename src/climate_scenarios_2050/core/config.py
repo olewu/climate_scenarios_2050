@@ -65,6 +65,12 @@ def validate(cfg: dict):
     """consistency of the region, targets, predictor and observational datasets (clear errors early)"""
     targets, sources = cfg.get("targets", {}), cfg.get("obs_sources", {})
     fields = cfg.get("preprocess", {}).get("fields", {})
+    c6 = cfg.get("cmip6", {})
+    full = c6.get("full_period")
+    if full is not None and not (len(full) == 2 and all(isinstance(y, int) for y in full) and full[0] <= full[1]):
+        raise ValueError(f"cmip6.full_period must be [first year, last year], got {full}")
+    if "min_scenario_end" in c6:
+        raise ValueError("cmip6.min_scenario_end was replaced by cmip6.full_period (the last year is the required scenario end)")
     for name in cfg.get("region", {}).get("targets", []):
         if name not in targets:
             raise ValueError(f"region.targets: {name} is not defined in `targets`")
