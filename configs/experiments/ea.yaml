@@ -1,8 +1,7 @@
-cmip6:
-  weighting: member
+# East Atlantic pattern (mode 2 of the DJFM SLP EOF) alone as predictor; nao_ea.yaml uses NAO and EA jointly.
 
 predictor:
   name: ea
   mode: 2
   sign_reference_point: {lon: -20, lat: 55, sign: negative}   # EA+: low pressure west of the British Isles (CPC)
-
+  reference_skill: null                                        # the DCPP marker of the default is for the NAO

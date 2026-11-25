@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Index skill comparison</title>
+<link rel="stylesheet" href="gallery.css">
+</head>
+<body>
+<nav><a href="index.html">Gallery</a><a href="index_skill.html">Index skill</a><a href="linear_model.html">Linear model</a><a href="target.html">Target skill</a><a href="partition.html">Partition</a></nav>
+<h1>Index skill comparison</h1>
+<div class="note">Index hindcast evaluation (evaluate-index), verified against the observed <i>internal</i> index.
+  <b>Skill per lead time</b>: centred running means (evaluation.index_continuous), correlation or 1 − RMSE/std over all
+  inits, with 95 % bootstrap bands. <b>Window changes</b>: change of the target-window mean against the 20 years before
+  init. <b>Hindcast</b>: ensemble mean of the analogue hindcast by init and valid year, observed internal index below.
+  Different indices are standardized differently and differ in persistence: compare each one's margin over its own
+  AR(1) baselines and null test rather than the raw scores. Each column is one experiment and index;
+  "overlay" draws all columns into one chart.</div>
+
+<div class="bar">
+  <label>Scenario<select id="scenario"></select></label>
+  <label>View<select id="view"></select></label>
+  <label>Score<select id="measure"></select></label>
+  <label>Layout<select id="layout"></select></label>
+  <label>y min<input id="ymin" type="number" step="0.1"></label>
+  <label>y max<input id="ymax" type="number" step="0.1"></label>
+  <label class="check"><input id="bands" type="checkbox" checked>CI bands</label>
+  <label class="check"><input id="null" type="checkbox" checked>null p95</label>
+  <label>Chart width<select id="width"></select></label>
+  <span><button id="add">+ column</button> <button id="remove">− column</button></span>
+  <div class="checks" id="products"></div>
+</div>
+<details class="defs" open><summary>Definitions of the current selection</summary><div id="defs"></div></details>
+<div class="cols" id="cols"></div>
+<div id="overlay"></div>
+
+<script src="gallery.js"></script>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const PRODUCT_ORDER = ["analogue", "cmip6_all", "ar1_fair", "ar1_all", "ar1_rm_fair", "sine_trend", "persistence"];
+const DEFAULT_PRODUCTS = ["analogue", "ar1_fair"];
+const DASH = {analogue: "", ar1_fair: "6 3", cmip6_all: "2 2", ar1_all: "8 2 2 2", ar1_rm_fair: "4 2", sine_trend: "1 3", persistence: "10 3"};
+const VIEWS = [["lead", "Skill per lead time"], ["windows", "Window changes"], ["hindcast", "Hindcast"]];
+const MEASURES = {lead: [["corr", "correlation"], ["nrmse", "1 − RMSE/std"], ["crps", "CRPS (lower is better)"], ["crpss_cmip6", "CRPSS (ref.: cmip6_all)"]],
+                  windows: [["corr", "correlation"], ["nrmse", "1 − RMSE/std"], ["crpss", "CRPSS (ref.: no change)"], ["crps", "CRPS (lower is better)"],
+                            ["crpss_cmip6", "CRPSS (ref.: cmip6_all)"]], hindcast: [["mean", "ensemble mean"]]};
+let registry = null, state = G.readHash();
+
+function save() {
+  const s = {scenario: $("scenario").value, view: $("view").value, measure: $("measure").value, layout: $("layout").value,
+             ymin: $("ymin").value, ymax: $("ymax").value, bands: $("bands").checked ? 1 : 0, null: $("null").checked ? 1 : 0,
+             width: $("width").value, ncol: state.ncol, products: selectedProducts().join(",")};
+  for (let c = 0; c < state.ncol; c++) for (const k of ["exp", "index"]) s["c" + c + k] = state["c" + c + k];
+  state = {...state, ...s};
+  G.writeHash(s);
+}
+function selectedProducts() { return [...document.querySelectorAll("#products input:checked")].map(e => e.value); }
+
+function buildColumns() {
+  const wrap = $("cols"); wrap.innerHTML = "";
+  const names = Object.keys(registry.experiments).filter(n => Object.keys(registry.experiments[n].evaluate_index || {}).length).sort();
+  for (let c = 0; c < state.ncol; c++) {
+    const el = document.createElement("div"); el.className = "col";
+    el.innerHTML = `<div class="head"><label>Experiment<select class="exp"></select></label><label>Index<select class="index"></select></label></div>
+      <div class="title"></div><div class="sub"></div><div class="chart"></div>`;
+    wrap.appendChild(el);
+    const exp = el.querySelector(".exp");
+    G.select(exp, names, state["c" + c + "exp"] || names[Math.min(c, names.length - 1)]);
+    state["c" + c + "exp"] = exp.value;
+    exp.onchange = () => { state["c" + c + "exp"] = exp.value; state["c" + c + "index"] = ""; render(); };
+    el.querySelector(".index").onchange = ev => { state["c" + c + "index"] = ev.target.value; render(); };
+  }
+}
+
+async function loadColumn(c, scenario) {
+  const exp = state["c" + c + "exp"], cases = (registry.experiments[exp] || {}).evaluate_index || {};
+  const indices = Object.keys(cases).filter(k => k.startsWith(scenario + "|")).map(k => k.split("|")[1]);
+  const el = document.querySelectorAll(".col")[c];
+  const index = G.select(el.querySelector(".index"), indices, state["c" + c + "index"]);
+  state["c" + c + "index"] = index;
+  const entry = cases[scenario + "|" + index];
+  if (!entry) return {exp, index, missing: true};
+  return {exp, index, stale: !!entry.stale, data: await G.json("data/" + entry.export + ".json")};
+}
+
+// series of one column for the lead/window views
+function seriesOf(col, view, measure, products, bands, withNull, colour) {
+  const out = [], d = col.data;
+  const crpsLead = view === "lead" && (measure === "crps" || measure === "crpss_cmip6");
+  const src = crpsLead ? d.continuous_crps : view === "lead" ? d.continuous : d.windows;
+  if (!src) return out;
+  const key = crpsLead ? measure : view === "lead" ? measure + "_score" : measure;
+  // CRPSS against the full CMIP6 ensemble: 1 - CRPS(p) / CRPS(cmip6_all), same windows and inits
+  const ref = src.crps ? src.crps[src.products.indexOf("cmip6_all")] : null;
+  const values = i => measure === "crpss_cmip6" && !crpsLead ? (src.crps && ref ? src.crps[i].map((v, k) => v === null || !ref[k] ? null : 1 - v / ref[k]) : null) : (src[key] ? src[key][i] : null);
+  for (const p of products) {
+    const i = src.products.indexOf(p);
+    if (i < 0 || !values(i)) continue;
+    const s = {label: (colour ? `${col.exp} · ${col.index} · ` : "") + p, color: colour || G.COLORS[p] || "#555", dash: DASH[p] || "", y: values(i)};
+    const lo = view === "lead" ? src[measure + "_ci_low"] : (measure === "corr" ? src.corr_ci_low : null);
+    const hi = view === "lead" ? src[measure + "_ci_high"] : (measure === "corr" ? src.corr_ci_high : null);
+    // bands: analogue and AR(1) fair; in the overlay only the analogue's (readability)
+    if (bands && lo && hi && (p === "analogue" || (p === "ar1_fair" && !colour))) { s.lo = lo[i]; s.hi = hi[i]; }
+    out.push(s);
+  }
+  const nk = view === "lead" ? `continuous_${measure}_p95` : `window_${measure}_p95`;
+  if (withNull && d.null && d.null[nk]) out.push({label: (colour ? `${col.exp} · ${col.index} · ` : "") + "null p95", color: colour || G.COLORS.null_p95, dash: "2 3", width: 1.2, y: d.null[nk]});
+  return out;
+}
+
+function autoLimits(series, measure) {
+  let lo = Infinity, hi = -Infinity;
+  for (const s of series) for (const arr of [s.y, s.lo, s.hi]) if (arr) for (const v of arr) if (v !== null && v !== undefined) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  if (!isFinite(lo)) return [-1, 1];
+  const pad = 0.05 * (hi - lo || 1);
+  lo = Math.floor((lo - pad) * 10) / 10; hi = Math.ceil((hi + pad) * 10) / 10;
+  if (measure === "corr") { lo = Math.max(lo, -1); hi = Math.min(hi, 1); }
+  return [Math.min(lo, 0), Math.max(hi, 0)];
+}
+
+let renderId = 0;
+async function render() {
+  const id = ++renderId;
+  const scen = new Set();
+  for (let c = 0; c < state.ncol; c++) for (const k of Object.keys((registry.experiments[state["c" + c + "exp"]] || {}).evaluate_index || {})) scen.add(k.split("|")[0]);
+  const scenario = G.select($("scenario"), [...scen].sort(), state.scenario);
+  const view = G.select($("view"), VIEWS, state.view);
+  const measure = G.select($("measure"), MEASURES[view], state.measure);
+  const cols = await Promise.all([...Array(state.ncol).keys()].map(c => loadColumn(c, scenario).catch(e => ({error: e.message}))));
+  if (id !== renderId) return;
+  // products available in the shown columns
+  const avail = new Set();
+  for (const col of cols) if (col.data) for (const p of ((view === "lead" ? col.data.continuous : col.data.windows) || {}).products || []) avail.add(p);
+  const prodList = PRODUCT_ORDER.filter(p => avail.has(p)).concat([...avail].filter(p => !PRODUCT_ORDER.includes(p)));
+  const chosen = state.products !== undefined ? state.products.split(",") : DEFAULT_PRODUCTS;
+  $("products").innerHTML = prodList.map(p => `<label><input type="checkbox" value="${p}" ${chosen.includes(p) ? "checked" : ""}>` +
+    `<span style="color:${G.COLORS[p] || "#555"}">${p}</span></label>`).join("");
+  for (const e of $("products").querySelectorAll("input")) e.onchange = () => { state.products = selectedProducts().join(","); render(); };
+  $("products").style.display = view === "hindcast" ? "none" : "";
+  const products = selectedProducts(), width = +$("width").value, overlay = $("layout").value === "overlay" && view !== "hindcast";
+  save();
+
+  const els = document.querySelectorAll(".col");
+  $("overlay").innerHTML = "";
+  $("defs").innerHTML = definitions(view, measure, view === "hindcast" ? [] : products, cols.find(c => c.data));
+  if (view === "hindcast") return renderHindcast(cols, els, width);
+  const perCol = cols.map((col, c) => col.data ? seriesOf(col, view, measure, products, $("bands").checked, $("null").checked, overlay ? G.PALETTE[c % G.PALETTE.length] : null) : []);
+  let [y0, y1] = autoLimits(perCol.flat(), measure);
+  if ($("ymin").value !== "") y0 = +$("ymin").value;
+  if ($("ymax").value !== "") y1 = +$("ymax").value;
+  const xvals = col => view === "lead" ? col.data.continuous.lead : col.data.windows.window;
+  const label = MEASURES[view].find(m => m[0] === measure)[1];
+  cols.forEach((col, c) => {
+    const el = els[c], chart = el.querySelector(".chart");
+    chart.innerHTML = "";
+    el.querySelector(".title").textContent = col.data ? `${col.exp} · ${col.index.toUpperCase()}` : (col.exp || "");
+    el.querySelector(".sub").textContent = (col.stale ? "⚠ results of earlier settings (rerun the step and pixi run gallery)\n" : "") + (col.error ? col.error : col.missing ? "no index evaluation for this scenario" :
+      ((measure === "crps" || measure === "crpss_cmip6") && view === "windows" && !(col.data.windows || {}).crps ? "export without the CRPS: rerun pixi run gallery\n" : "") +
+      ((measure === "crps" || measure === "crpss_cmip6") && view === "lead" && !col.data.continuous_crps ? "no CRPS per lead yet: rerun pixi run evaluate-index and pixi run gallery\n" : "") +
+      (col.data.overview ? `observations: ${col.data.overview.attrs.observations || "?"}, matching window ${col.data.overview.attrs.matching_window || "?"}` +
+       (view === "lead" ? `, running mean ${col.data.overview.attrs.running_mean || "?"}` : "") : ""));
+    if (!col.data || overlay) return;
+    G.lineChart(chart, {x: xvals(col), series: perCol[c], ylim: [y0, y1], width, height: Math.round(width * 0.62),
+                        xlabel: view === "lead" ? "lead time [years]" : "target window [lead years]", ylabel: label});
+  });
+  if (overlay) {
+    const first = cols.find(c => c.data && (view === "lead" ? c.data.continuous : c.data.windows));
+    if (!first) return;
+    const box = document.createElement("div"); box.className = "col"; $("overlay").appendChild(box);
+    G.lineChart(box, {x: xvals(first), series: perCol.flat(), ylim: [y0, y1], width: Math.max(width, 640), height: Math.round(Math.max(width, 640) * 0.55),
+                      title: "all columns", xlabel: view === "lead" ? "lead time [years]" : "target window [lead years]", ylabel: label});
+  }
+}
+
+function definitions(view, measure, products, col) {
+  const info = col ? ((registry.experiments[col.exp] || {}).info || {}) : {};
+  const attrs = col && col.data.overview ? col.data.overview.attrs : {};
+  const N = attrs.running_mean || 8, win = attrs.matching_window || 70, n = info.reference_length || 20, M = info.M || 100;
+  const row = (k, f, note, sel) => `<tr class="${sel ? "sel" : ""}"><td>${k}</td><td class="f">${f}</td><td class="muted">${note || ""}</td></tr>`;
+  const PRODUCTS = {
+    analogue: ["mean of the M = " + M + " CMIP6 members whose filtered index best matches the observed index over the " + win + " years up to Y; their internal index after Y", "probabilistic (members)"],
+    cmip6_all: ["mean of the internal index of all members of the scenario, no selection (climatological reference)",
+                "near-zero forecast, the same for every init (lead only shifts the verified years): its correlation is not meaningful, its RMSE skill and CRPS are"],
+    ar1_fair: ["AR(1) fitted to the observed annual internal index over the matching window (" + win + " years) around a linear trend (not extrapolated); 100 realizations", ""],
+    ar1_all: ["the same AR(1), fitted to all observed years up to Y", ""],
+    ar1_rm_fair: ["AR(1) fitted to the " + N + "-year running mean (old method)", "continuous view only"],
+    sine_trend: ["sine + trend fit of the low-pass filtered observed index plus MA(1) residuals (old FFT forecast)", "deterministic"],
+    persistence: ["mean of the last " + n + " observed years, held at all leads", "deterministic"],
+  };
+  const SCORES = view === "lead" ? {
+    corr: `corr<sub>Y</sub>( RM<sub>${N}</sub>[x̂](Y+k), RM<sub>${N}</sub>[I<sup>int</sup><sub>obs</sub>](Y+k) )`,
+    nrmse: `1 − RMSE / std(RM<sub>${N}</sub>[I<sup>int</sup><sub>obs</sub>]),  same pairs`,
+    crps: `CRPS = mean<sub>Y</sub> CRPS( {RM<sub>${N}</sub>[x<sub>m</sub>](Y+k)}<sub>m</sub>, RM<sub>${N}</sub>[I<sup>int</sup><sub>obs</sub>](Y+k) )  <span class="muted">(members m of the product; index units, lower is better; products with members only)</span>`,
+    crpss_cmip6: `1 − Σ<sub>Y</sub> CRPS(product) / Σ<sub>Y</sub> CRPS(cmip6_all)  <span class="muted">(inits both cover; band: 95 % paired moving-block bootstrap over Y, blocks of max(n<sup>1/3</sup>, ${N}) inits)</span>`,
+  } : {
+    corr: `corr<sub>Y</sub>( Δx̂, ΔI ),  Δ· = W[·] − R[·]`,
+    nrmse: `1 − RMSE(Δx̂, ΔI) / std(ΔI)`,
+    crpss: `1 − CRPS(members) / CRPS( N(0, σ<sub>ΔI</sub>²) )  <span class="muted">(reference: no change, spread of the observed changes; probabilistic products only)</span>`,
+    crps: `CRPS = mean<sub>Y</sub> ∫ ( F<sub>Y</sub>(z) − 1{ΔI(Y) ≤ z} )² dz  <span class="muted">(F: empirical distribution of the members' Δx; index units, lower is better)</span>`,
+    crpss_cmip6: `1 − CRPS(product) / CRPS(cmip6_all)  <span class="muted">(> 0: the product's members (selection, spread) beat the unselected ensemble; same inits; no uncertainty band)</span>`,
+  };
+  let h = `<div class="muted">Y: init year, k: lead (seasons Y+k). x̂: ensemble-mean hindcast of the internal index; I<sup>int</sup><sub>obs</sub>: observed internal index
+    (${col ? (col.data.overview ? attrs.observations : "") : ""}; forced part, the scaled MMEM, removed with full-period coefficients for the lead view, without the
+    target window and reference for the window view). RM<sub>${N}</sub>: centred ${N}-year running mean. W[·]: mean over the window seasons Y+a … Y+b, R[·]: the
+    ${n} seasons up to Y. Bands: 95 % moving-block bootstrap over Y. null p95: 95th percentile of the score of the analogue method against synthetic AR(1)
+    "observations".</div>`;
+  if (view === "hindcast") {
+    h += `<table>${row("hindcast", `x̂(Y, Y+k) = mean<sub>k∈A</sub> RM<sub>${N}</sub>[I<sup>int</sup><sub>k</sub>](Y+k)`, `colour at init year Y (rows) and valid year Y+k (columns); line below: RM<sub>${N}</sub>[I<sup>int</sup><sub>obs</sub>]`, true)}</table>`;
+    return h;
+  }
+  h += `<h4>Score</h4><table>${row(measure, SCORES[measure] || measure, "", true)}</table>`;
+  h += `<h4>Products shown</h4><table>${products.map(p => row(p, PRODUCTS[p] ? PRODUCTS[p][0] : p, PRODUCTS[p] ? PRODUCTS[p][1] : "", true)).join("")}</table>`;
+  return h;
+}
+
+// ensemble-mean hindcast by init year (rows) and valid year (columns), observed internal index below
+function renderHindcast(cols, els, width) {
+  let limit = 0;
+  const grids = cols.map(col => {
+    if (!col.data || !col.data.overview) return null;
+    const o = col.data.overview, inits = o.init_year, leads = o.lead;
+    const y0 = Math.min(...inits) + 1, y1 = Math.max(...o.year);
+    const ncol = y1 - y0 + 1, vals = new Float32Array(inits.length * ncol).fill(NaN), abs = [];
+    inits.forEach((init, r) => leads.forEach((lead, k) => {
+      const v = o.analogue_mean[r][k], yr = init + lead;
+      if (lead > 0 && v !== null && yr >= y0 && yr <= y1) { vals[r * ncol + (yr - y0)] = v; abs.push(Math.abs(v)); }
+    }));
+    abs.sort((a, b) => a - b);
+    limit = Math.max(limit, abs[Math.floor(0.98 * (abs.length - 1))] || 0);
+    return {vals, ncol, nrow: inits.length, y0, y1, inits, o};
+  });
+  cols.forEach((col, c) => {
+    const el = els[c], chart = el.querySelector(".chart"), g = grids[c];
+    chart.innerHTML = "";
+    el.querySelector(".title").textContent = col.data ? `${col.exp} · ${col.index.toUpperCase()}` : (col.exp || "");
+    el.querySelector(".sub").textContent = !g ? "no hindcast overview" :
+      `rows: init ${g.inits[0]}-${g.inits[g.inits.length - 1]}, columns: valid year ${g.y0}-${g.y1}; colour limit ±${limit.toFixed(2)}`;
+    if (!g) return;
+    const cv = document.createElement("canvas"); chart.appendChild(cv);
+    G.heatmap(cv, g.vals, g.nrow, g.ncol, limit, width, Math.round(width * 0.55));
+    cv.title = "x: valid year, y: init year";
+    cv.onmousemove = ev => {
+      const r = cv.getBoundingClientRect(), x = Math.floor((ev.clientX - r.left) / r.width * g.ncol), y = g.nrow - 1 - Math.floor((ev.clientY - r.top) / r.height * g.nrow);
+      const v = g.vals[y * g.ncol + x];
+      cv.title = `init ${g.inits[y]}, valid ${g.y0 + x} (lead ${g.y0 + x - g.inits[y]}): ${Number.isNaN(v) ? "–" : v.toFixed(2)}`;
+    };
+    const cb = document.createElement("canvas"); chart.appendChild(cb);
+    G.drawColorbar(cb, limit, "ensemble-mean internal index", width);
+    const obsYears = g.o.year.map(Number), y = g.o.observed;
+    const sel = obsYears.map((yr, i) => i).filter(i => obsYears[i] >= g.y0 - 1);
+    G.lineChart(chart, {x: sel.map(i => obsYears[i]), series: [{label: "observed internal index (running mean)", color: "#1f77b4", y: sel.map(i => y[i])}],
+                        ylim: autoLimits([{y: sel.map(i => y[i])}], "x"), width, height: Math.round(width * 0.3), xlabel: "year"});
+  });
+}
+
+async function main() {
+  try { registry = await G.json("experiments.json"); }
+  catch (e) { $("cols").textContent = "No experiments registered yet (pixi run gallery --config ...)."; return; }
+  state.ncol = Math.max(1, Math.min(4, +state.ncol || 2));
+  G.select($("layout"), [["side", "side by side"], ["overlay", "overlay"]], state.layout || "side");
+  G.select($("width"), [["400", "small"], ["520", "medium"], ["680", "large"]], state.width || "520");
+  if (state.ymin) $("ymin").value = state.ymin;
+  if (state.ymax) $("ymax").value = state.ymax;
+  $("bands").checked = state.bands !== "0"; $("null").checked = state.null !== "0";
+  for (const k of ["scenario", "view", "measure"]) $(k).onchange = () => { state[k] = $(k).value; $("ymin").value = ""; $("ymax").value = ""; render(); };
+  for (const k of ["layout", "ymin", "ymax", "bands", "null", "width"]) $(k).onchange = render;
+  $("add").onclick = () => { if (state.ncol < 4) { state.ncol++; buildColumns(); render(); } };
+  $("remove").onclick = () => { if (state.ncol > 1) { state.ncol--; buildColumns(); render(); } };
+  buildColumns(); render();
+}
+main();
+</script>
+</body>
+</html>

@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Uncertainty partition</title>
+<link rel="stylesheet" href="gallery.css">
+</head>
+<body>
+<nav><a href="index.html">Gallery</a><a href="index_skill.html">Index skill</a><a href="linear_model.html">Linear model</a><a href="target.html">Target skill</a><a href="partition.html">Partition</a></nav>
+<h1>Uncertainty partition of projected window changes</h1>
+<div class="note">Spread of the CMIP6 projections of the change of an N-year window mean against the reference period before
+  init, split into internal variability, model uncertainty and scenario uncertainty (Hawkins &amp; Sutton 2009), by the
+  centre year of the window (pixi run partition). Indices: from the forced/internal split of each scenario; targets:
+  area mean of the target's CMIP6 field over a box (partition.regions). Each column is one experiment and quantity.</div>
+
+<div class="bar">
+  <label>Window length<select id="length"></select></label>
+  <label>View<select id="view"></select></label>
+  <label>last year<input id="xmax" type="number" step="5"></label>
+  <label>y max<input id="ymax" type="number" step="0.1"></label>
+  <label>Mark year<input id="mark" type="number" step="1"></label>
+  <label>Chart width<select id="width"></select></label>
+  <span><button id="add">+ column</button> <button id="remove">− column</button></span>
+</div>
+<details class="defs" open><summary>Definitions</summary><div id="defs"></div></details>
+<div class="cols" id="cols"></div>
+
+<script src="gallery.js"></script>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const SOURCES = ["internal", "model", "scenario"];
+const SRC_COLORS = {internal: "#1f77b4", model: "#ff7f0e", scenario: "#2ca02c", total: "#222"};
+const SRC_LABELS = {internal: "internal variability", model: "model uncertainty", scenario: "scenario uncertainty", total: "total"};
+const SCEN_COLORS = {ssp119: "#1e9583", ssp126: "#1d3354", ssp245: "#ea9a36", ssp370: "#e71d25", ssp585: "#951b1e"};   // IPCC AR6 colours
+const VIEWS = [["fraction", "fraction of variance (stacked)"], ["std", "standard deviation per source"], ["means", "multi-model mean change per scenario"]];
+let registry = null, state = G.readHash();
+
+function save() {
+  const s = {length: $("length").value, view: $("view").value, xmax: $("xmax").value, ymax: $("ymax").value, mark: $("mark").value, width: $("width").value, ncol: state.ncol};
+  for (let c = 0; c < state.ncol; c++) for (const k of ["exp", "q"]) s["c" + c + k] = state["c" + c + k];
+  state = {...state, ...s};
+  G.writeHash(s);
+}
+
+function label(key, entry) {
+  const p = key.split("|");
+  return p[0] === "index" ? `index ${p[1]}` : `${p[1]} · ${p[2]}` + (entry && entry.cmip6 ? ` (CMIP6 ${entry.cmip6})` : "");
+}
+
+function buildColumns() {
+  const wrap = $("cols"); wrap.innerHTML = "";
+  const names = Object.keys(registry.experiments).filter(n => Object.keys(registry.experiments[n].partition || {}).length).sort();
+  for (let c = 0; c < state.ncol; c++) {
+    const el = document.createElement("div"); el.className = "col";
+    el.innerHTML = `<div class="head"><label>Experiment<select class="exp"></select></label><label>Quantity<select class="q"></select></label></div>
+      <div class="title"></div><div class="sub"></div><div class="chart"></div>`;
+    wrap.appendChild(el);
+    const exp = el.querySelector(".exp");
+    G.select(exp, names, state["c" + c + "exp"] || names[Math.min(c, names.length - 1)]);
+    state["c" + c + "exp"] = exp.value;
+    exp.onchange = () => { state["c" + c + "exp"] = exp.value; render(); };
+    el.querySelector(".q").onchange = ev => { state["c" + c + "q"] = ev.target.value; render(); };
+  }
+}
+
+async function loadColumn(c) {
+  const exp = state["c" + c + "exp"], cases = (registry.experiments[exp] || {}).partition || {};
+  const keys = Object.keys(cases).sort((a, b) => (a.startsWith("index") ? 0 : 1) - (b.startsWith("index") ? 0 : 1) || a.localeCompare(b));
+  const el = document.querySelectorAll(".col")[c];
+  const q = G.select(el.querySelector(".q"), keys.map(k => [k, label(k, cases[k])]), state["c" + c + "q"] || keys[Math.min(c, keys.length - 1)]);
+  state["c" + c + "q"] = q;
+  const entry = cases[q];
+  if (!entry) return {exp, missing: true};
+  return {exp, q, stale: !!entry.stale, data: await G.json("data/" + entry.export + ".json")};
+}
+
+let renderId = 0;
+async function render() {
+  const id = ++renderId;
+  const cols = await Promise.all([...Array(state.ncol).keys()].map(c => loadColumn(c).catch(e => ({error: e.message}))));
+  if (id !== renderId) return;
+  const lengths = [...new Set(cols.filter(c => c.data).flatMap(c => c.data.window_length))].sort((a, b) => a - b);
+  const length = +G.select($("length"), lengths.map(String), state.length || (lengths.includes(10) ? "10" : String(lengths[0])));
+  const view = G.select($("view"), VIEWS, state.view);
+  save();
+  const width = +$("width").value, xmax = $("xmax").value === "" ? null : +$("xmax").value, ymax = $("ymax").value === "" ? null : +$("ymax").value;
+  const mark = $("mark").value === "" ? [] : [+$("mark").value];
+  $("defs").innerHTML = definitions(cols.find(c => c.data), length);
+  // y limit per column (the units differ between quantities), unless y max is given
+  const prepared = cols.map(col => {
+    if (!col.data) return null;
+    const d = col.data, j = d.window_length.indexOf(length);
+    if (j < 0) return {missing: true};
+    const x = d.centre_year[j], keep = x.map(v => xmax === null || v <= xmax);
+    const cut = arr => arr.map((v, i) => keep[i] ? v : null);
+    const out = {x, keep, j};
+    if (view === "std") {
+      out.series = [...SOURCES, "total"].map(s => ({label: SRC_LABELS[s], color: SRC_COLORS[s], dash: s === "total" ? "5 3" : "",
+        y: cut((s === "total" ? d.total[j] : d.variance[s][j]).map(v => v === null ? null : Math.sqrt(v)))}));
+    } else if (view === "means") {
+      out.series = d.scenarios.map(s => ({label: s, color: SCEN_COLORS[s] || "#555", y: cut(d.scenario_mean[s][j])}));
+      // internal variability (1 std) as a band around zero
+      const sd = d.variance.internal[j].map(v => v === null ? null : Math.sqrt(v));
+      out.series.push({label: "± internal std", color: "#999", dash: "1 0", width: 0.01, y: cut(sd.map(() => 0)), lo: cut(sd.map(v => v === null ? null : -v)), hi: cut(sd)});
+    }
+    out.lim = 0;
+    if (out.series) for (const s of out.series) for (const arr of [s.y, s.lo, s.hi]) if (arr) for (const v of arr) if (v !== null) out.lim = Math.max(out.lim, Math.abs(v));
+    return out;
+  });
+  const els = document.querySelectorAll(".col");
+  cols.forEach((col, c) => {
+    const el = els[c], chart = el.querySelector(".chart"), p = prepared[c];
+    chart.innerHTML = "";
+    el.style.maxWidth = (width + 20) + "px";
+    const d = col.data;
+    el.querySelector(".title").textContent = d ? `${col.exp} · ${label(col.q, d)}` : (col.exp || "");
+    el.querySelector(".sub").textContent = (col.stale ? "⚠ results of earlier settings (rerun the step and pixi run gallery)\n" : "") +
+      (col.error ? col.error : col.missing ? "no partition for this experiment" : p && p.missing ? `no ${length}-year windows in this export` :
+       `init ${d.init}, reference ${d.reference_period}, ${d.units}; ` + d.scenarios.map((s, i) => `${s}: ${d.n_models[i]} models / ${d.n_members[i]} members`).join(", ") + (d.box ? `\nbox: ${d.box}` : ""));
+    if (!d || !p || p.missing) return;
+    const height = Math.round(width * 0.62), xlim = [Math.min(...p.x), xmax === null ? Math.max(...p.x) : Math.min(xmax, Math.max(...p.x))];
+    if (view === "fraction") {
+      G.stackChart(chart, {x: p.x, xlim, layers: SOURCES.map(s => ({label: SRC_LABELS[s], color: SRC_COLORS[s], y: d.fraction[s][p.j]})), ylim: [0, 1],
+                           width, height, vlines: mark, xlabel: "centre year of the window", ylabel: "fraction of variance"});
+    } else {
+      const top = ymax !== null ? ymax : Math.ceil(p.lim * 11) / 10 || 1;
+      G.lineChart(chart, {x: p.x, series: p.series, ylim: view === "std" ? [0, top] : [-top, top], width, height, vlines: mark,
+                          xlabel: "centre year of the window", ylabel: view === "std" ? `standard deviation [${d.units}]` : `change [${d.units}]`});
+    }
+  });
+}
+
+function definitions(col, N) {
+  const d = col ? col.data : null, Y = d ? d.init : "Y", n = d ? d.reference_length : 20;
+  const row = (k, f, note) => `<tr><td>${k}</td><td class="f">${f}</td><td class="muted">${note || ""}</td></tr>`;
+  return `<div class="muted">x = F<sub>m,s</sub> + I<sub>r</sub>: projected series of member r of model m in scenario s, forced part F (per model and
+    scenario, from the split) plus internal part I. Δ[x](l) = mean of x over the ${N} years ${Y}+l … ${Y}+l+${N - 1} − mean over the ${n} years up to ${Y}
+    (${d ? d.reference_period : "reference"}); plotted at the window's centre year. Relative targets: Δ in % of the model's forced reference mean.
+    Means over m: every model counts once (cmip6.weighting: model); var: ddof 1.</div>
+    <table>
+    ${row("internal", "I(l) = mean<sub>s</sub> mean<sub>m</sub> mean<sub>r∈m</sub> Δ[I<sub>r</sub>](l)²", "internal variability of the window change")}
+    ${row("model", "M(l) = mean<sub>s</sub> var<sub>m</sub> Δ[F<sub>m,s</sub>](l)", "spread of the models' forced changes")}
+    ${row("scenario", "S(l) = var<sub>s</sub> mean<sub>m</sub> Δ[F<sub>m,s</sub>](l)", "spread of the multi-model mean changes across scenarios")}
+    ${row("fraction", "I/T, M/T, S/T,  T = I + M + S", "")}
+    </table>
+    <div class="muted">The scenarios have different numbers of models (see each column), so S partly reflects different model sets.
+    With split.method: mmem every model's forced part is a scaled multi-model mean, so M only reflects differences in amplitude.</div>`;
+}
+
+async function main() {
+  try { registry = await G.json("experiments.json"); }
+  catch (e) { $("cols").textContent = "No experiments registered yet (pixi run gallery --config ...)."; return; }
+  state.ncol = Math.max(1, Math.min(4, +state.ncol || 2));
+  G.select($("width"), [["400", "small"], ["520", "medium"], ["680", "large"]], state.width || "520");
+  if (state.xmax) $("xmax").value = state.xmax;
+  if (state.ymax) $("ymax").value = state.ymax;
+  $("mark").value = state.mark !== undefined ? state.mark : "2050";
+  for (const k of ["length", "view"]) $(k).onchange = () => { state[k] = $(k).value; $("ymax").value = ""; render(); };
+  for (const k of ["xmax", "ymax", "mark", "width"]) $(k).onchange = render;
+  $("add").onclick = () => { if (state.ncol < 4) { state.ncol++; buildColumns(); render(); } };
+  $("remove").onclick = () => { if (state.ncol > 1) { state.ncol--; buildColumns(); render(); } };
+  buildColumns(); render();
+}
+main();
+</script>
+</body>
+</html>

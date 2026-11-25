@@ -48,7 +48,8 @@ def test_unperturbed_statistics_match_scores():
     t = da(target)
     ref_spread = ev.persistence_spread(t, windows)
     s_m = ev.gaussian_scores(da(pred_m), da(np.full(target.shape, target.std())), t, ref_spread, (0.5,))
-    s_0 = ev.gaussian_scores(da(pred_0), da(np.full(target.shape, target.std())), t, ref_spread, (0.5,))
+    # M0: spread = RMS of its own errors (non-overlapping samples), as in the evaluation
+    s_0 = ev.gaussian_scores(da(pred_0), ev.error_spread(t, da(pred_0), windows), t, ref_spread, (0.5,))
     np.testing.assert_allclose(stats[0, 0, 2], (s_m["crpss"] - s_0["crpss"]).values, rtol=1e-4, atol=1e-5)
     np.testing.assert_allclose(stats[1, 0, 2], (s_m["corr"] - s_0["corr"]).values, rtol=1e-4, atol=1e-5)
     assert np.isnan(stats[:, 0, 0]).all()   # M0 itself
@@ -70,7 +71,7 @@ def test_coherent_surrogates_keep_spectra_and_cross_spectra():
 def run_test(rng, info, n=199):
     years, u, inits, windows, win_op, ref_op, target, pred_m, pred_0 = setup(rng, info=info)
     problem = make_problem(target, pred_m, pred_0, inits, windows)
-    observed, exceed, n_null, field, obs_field = sg._chunk(problem, np.fft.rfft(u, axis=0), sg.coherent_phases(len(years), n, 5), len(years), win_op, ref_op, np.ones(u.shape[1]))
+    observed, exceed, n_null, field, obs_field = sg._chunk(problem, np.fft.rfft(u, axis=0), sg.coherent_phases(len(years), n, 5), len(years), (win_op, ref_op), np.ones(u.shape[1]))
     p = (1 + exceed) / (n_null + 1)
     return p[:, 0, 2]
 
@@ -110,3 +111,43 @@ def test_leave_out_operators_match_fit():
         internal = y - fc.forced_part(design, coef.isel(init_year=ii, window=iw))
         np.testing.assert_allclose(win_lo[ii, iw] @ y.values, win[ii, iw] @ internal.values, atol=1e-10)
         np.testing.assert_allclose(ref_lo[ii, iw] @ y.values, ref[ii, iw] @ internal.values, atol=1e-10)
+
+
+def test_pointwise_operators_match_pointwise_fit():
+    """per-point design (forced: cmip6): operators reproduce the internal means of each point's leave-out fit"""
+    from climate_scenarios_2050.split import forced as fc
+
+    rng = np.random.default_rng(6)
+    years = np.arange(1940, 2025)
+    windows = [(1, 5), (6, 10)]
+    inits = np.arange(1960, 2015)
+    points = 4
+    field = xr.DataArray(np.cumsum(rng.standard_normal((len(years), points)), axis=0), dims=("year", "point"), coords={"year": years})
+    y = 1.5 * field + rng.standard_normal((len(years), points))
+    design = fc.pointwise_design(field, years)
+    excl = fc.window_exclusions(years, inits, windows, lag=0, reference_length=20)
+    coef = fc.fit_coefficients(y, design, excl, 15)
+    win, ref = sg.averaging_operators(years, inits, windows, 20)
+    win_lo, ref_lo = sg.leave_out_operators_pointwise(win, ref, design.transpose("year", "term", "point").values, excl.values, 15)
+    for ii, iw in [(0, 0), (10, 1), (40, 0)]:
+        internal = (y - fc.forced_part(design, coef.isel(init_year=ii, window=iw))).transpose("year", "point").values
+        np.testing.assert_allclose(np.einsum("yp,yp->p", win_lo[ii, iw], y.values), win[ii, iw] @ internal, atol=1e-4)
+        np.testing.assert_allclose(np.einsum("yp,yp->p", ref_lo[ii, iw], y.values), ref[ii, iw] @ internal, atol=1e-4)
+
+
+def test_pointwise_operators_equal_shared_for_identical_points():
+    """the same regressor at every point gives the shared operators"""
+    from climate_scenarios_2050.split import forced as fc
+
+    years = np.arange(1940, 2025)
+    windows = [(1, 10)]
+    inits = np.arange(1960, 2010)
+    m = np.linspace(0, 1, len(years)) ** 2
+    shared = fc.design_matrix(xr.DataArray(m[None], dims=("term", "year"), coords={"term": ["mmem"], "year": years}), years).values
+    per_point = np.repeat(shared[:, :, None], 3, axis=2)
+    excl = fc.window_exclusions(years, inits, windows, lag=0, reference_length=20).values
+    win, ref = sg.averaging_operators(years, inits, windows, 20)
+    a, b = sg.leave_out_operators(win, ref, shared, excl, 15)
+    c, d = sg.leave_out_operators_pointwise(win, ref, per_point, excl, 15)
+    np.testing.assert_allclose(c[..., 1], np.nan_to_num(a), atol=1e-5)
+    np.testing.assert_allclose(d[..., 2], np.nan_to_num(b), atol=1e-5)

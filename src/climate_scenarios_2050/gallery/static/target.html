@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Target skill comparison</title>
+<link rel="stylesheet" href="gallery.css">
+</head>
+<body>
+<nav><a href="index.html">Gallery</a><a href="index_skill.html">Index skill</a><a href="linear_model.html">Linear model</a><a href="target.html">Target skill</a><a href="partition.html">Partition</a></nav>
+<h1>Target skill comparison</h1>
+<div class="note" id="note">Maps of the target evaluation (evaluate-target). Each column shows one experiment; method and window
+  can be changed per column (otherwise the shared setting applies). Dots: points that beat M0 after the FDR test
+  (on corr: dcorr, on crpss: dcrpss). The view is stored in the address, so it can be bookmarked or sent.</div>
+
+<div class="bar">
+  <label>Scenario<select id="scenario"></select></label>
+  <label>Target<select id="tv"></select></label>
+  <label>Target kind<select id="kind"></select></label>
+  <label>Statistic<select id="stat"></select></label>
+  <label>Method<select id="method"></select></label>
+  <label>Window (lead years)<select id="window"></select></label>
+  <label>Colour limit<input id="limit" type="number" step="0.05" min="0.05"></label>
+  <label class="check"><input id="dots" type="checkbox" checked>significance dots</label>
+  <label>Dots: method beats<select id="dotsref"></select></label>
+  <label class="check"><input id="diff" type="checkbox">difference: column 1 − column 2</label>
+  <label>Diff. limit<input id="dlimit" type="number" step="0.05" min="0.05"></label>
+  <label>Map width<select id="width"></select></label>
+  <span><button id="add">+ column</button> <button id="remove">− column</button></span>
+</div>
+<details class="defs" id="defsbox" open><summary>Definitions of the current selection</summary><div id="defs"></div></details>
+<div class="cols" id="cols"></div>
+
+<script src="gallery.js"></script>
+<script>
+"use strict";
+const LIMITS = {corr: 1, crpss: 0.5, msss_m1: 0.5, dcrpss: 0.3, dcorr: 0.5, corr_anom: 1};
+const STAT_LABELS = {
+  corr: "corr", crpss: "crpss (vs M1)", msss_m1: "msss (vs M1) = 1 − MSE(m)/MSE(M1)",
+  dcrpss: "dcrpss = CRPSS(m) − CRPSS(M0)", dcorr: "dcorr = corr(m) − corr(M0)", corr_anom: "corr_anom = corr(m − M0, obs − M0)",
+};
+const STIPPLE = {corr: "dcorr", crpss: "dcrpss"};
+const METHOD_ORDER = ["M0", "M1", "M0c", "M0t", "M2a", "M3a", "M2b", "M3b", "M2b_b", "M3b_b", "perfect_index"];
+const WINDOW_ORDER = ["1-5", "6-10", "11-15", "16-20", "21-25", "26-30", "1-10", "11-20", "21-30", "1-20", "11-30"];
+const $ = id => document.getElementById(id);
+const SHARED = ["scenario", "tv", "kind", "stat", "method", "window"];
+
+let registry = null, state = G.readHash(), coastCache = {};
+let columns = [];   // per column: {geo, grid, values, el}
+
+function sortBy(order, xs) { return [...xs].sort((a, b) => (order.indexOf(a) + 1 || 99) - (order.indexOf(b) + 1 || 99) || (a < b ? -1 : 1)); }
+
+function save() {
+  const s = {};
+  for (const k of SHARED) s[k] = $(k).value;
+  s.limit = $("limit").value; s.dlimit = $("dlimit").value; s.dots = $("dots").checked ? 1 : 0; s.diff = $("diff").checked ? 1 : 0;
+  s.dotsref = $("dotsref").value;
+  s.width = $("width").value; s.ncol = state.ncol;
+  for (let c = 0; c < state.ncol; c++) for (const k of ["exp", "method", "window"]) s["c" + c + k] = state["c" + c + k];
+  state = {...state, ...s};
+  G.writeHash(s);
+}
+
+async function exportIndex(exp) {
+  const cases = (registry.experiments[exp] || {}).evaluate_target || {};
+  const c = cases[$("scenario").value + "|" + $("tv").value];
+  if (!c) return null;
+  const idx = await G.json("data/" + c.export + ".json");
+  idx.url = "data/" + c.export + ".bin";
+  idx.stale = !!c.stale;
+  if (!coastCache[idx.coast]) coastCache[idx.coast] = G.json("data/" + idx.coast);
+  idx.coastData = await coastCache[idx.coast];
+  return idx;
+}
+
+async function load(idx, key, kind) {
+  if (!idx) return null;
+  if (kind === "mask") {
+    const e = idx.sig[key];
+    if (!e) return null;
+    return G.unpackBits(await G.range(idx.url, e[0], e[1]), idx.shape[0] * idx.shape[1]);
+  }
+  const e = idx.maps[key];
+  if (!e) return null;
+  return G.decode(await G.range(idx.url, e[0], e[1]), idx.scale, idx.missing);
+}
+
+function fmt(v, d = 2) { return v === null || v === undefined || Number.isNaN(v) ? "–" : (v >= 0 ? "+" : "") + v.toFixed(d); }
+
+function buildColumns() {
+  const wrap = $("cols");
+  wrap.innerHTML = "";
+  const names = Object.keys(registry.experiments).sort();
+  for (let c = 0; c < state.ncol; c++) {
+    const el = document.createElement("div");
+    el.className = "col";
+    el.innerHTML = `<div class="head">
+        <label>Experiment<select class="exp"></select></label>
+        <label>Method<select class="method"></select></label>
+        <label>Window<select class="window"></select></label></div>
+      <div class="title"></div><div class="sub"></div><canvas class="map"></canvas><canvas class="cbar"></canvas><div class="hover"></div>`;
+    wrap.appendChild(el);
+    const exp = el.querySelector(".exp");
+    G.select(exp, names, state["c" + c + "exp"] || names[Math.min(c, names.length - 1)]);
+    state["c" + c + "exp"] = exp.value;
+    exp.onchange = () => { state["c" + c + "exp"] = exp.value; render(); };
+    for (const k of ["method", "window"]) el.querySelector("." + k).onchange = ev => { state["c" + c + k] = ev.target.value; render(); };
+  }
+  if ($("diff").checked) {
+    const el = document.createElement("div");
+    el.className = "col diff";
+    el.innerHTML = `<div class="head"><label>Difference</label></div><div class="title"></div><div class="sub"></div><canvas class="map"></canvas><canvas class="cbar"></canvas><div class="hover"></div>`;
+    wrap.appendChild(el);
+  }
+}
+
+let renderId = 0;
+async function render() {
+  const id = ++renderId;
+  const els = [...document.querySelectorAll(".col")];
+  const exps = els.filter(e => !e.classList.contains("diff")).map((e, c) => state["c" + c + "exp"]);
+  // options: union over the experiments shown
+  const allCases = new Set();
+  for (const e of exps) for (const k of Object.keys((registry.experiments[e] || {}).evaluate_target || {})) allCases.add(k);
+  const scen = [...new Set([...allCases].map(k => k.split("|")[0]))].sort(), tvs = [...new Set([...allCases].map(k => k.split("|")[1]))];
+  G.select($("scenario"), scen, state.scenario);
+  G.select($("tv"), tvs, state.tv);
+  const idxs = await Promise.all(exps.map(e => exportIndex(e).catch(err => ({error: err.message}))));
+  if (id !== renderId) return;
+  const keys = idxs.filter(i => i && !i.error).flatMap(i => Object.keys(i.maps).map(k => k.split("|")));
+  const kinds = [...new Set(keys.map(k => k[1]))].sort();
+  const kind = G.select($("kind"), kinds, state.kind);
+  const stats = ["corr", "crpss", "msss_m1", "dcorr", "dcrpss", "corr_anom"].filter(s => keys.some(k => k[0] === s));
+  const stat = G.select($("stat"), stats.map(s => [s, STAT_LABELS[s] || s]), state.stat);
+  const hidden = kind === "internal" ? ["M2a"] : [];
+  const methods = sortBy(METHOD_ORDER, new Set(keys.filter(k => k[0] === stat && k[1] === kind && !hidden.includes(k[2])).map(k => k[2])));
+  const windows = sortBy(WINDOW_ORDER, new Set(keys.filter(k => k[0] === stat && k[1] === kind).map(k => k[3])));
+  const method = G.select($("method"), methods, state.method);
+  const window_ = G.select($("window"), windows, state.window);
+  if (state.stat !== stat || !$("limit").value) $("limit").value = LIMITS[stat] || 1;
+  if (!$("dlimit").value) $("dlimit").value = (LIMITS[stat] || 1) / 2;
+  state.stat = stat;
+  const limit = +$("limit").value, width = +$("width").value;
+  save();
+
+  columns = [];
+  const shown = [], drawn = [];
+  for (let c = 0; c < exps.length; c++) {
+    const el = els[c], idx = idxs[c];
+    const m = G.select(el.querySelector(".method"), [["", "(shared)"], ...methods], state["c" + c + "method"] || "") || method;
+    drawn.push([exps[c], m]);
+    const w = G.select(el.querySelector(".window"), [["", "(shared)"], ...windows], state["c" + c + "window"] || "") || window_;
+    const expInfo = registry.experiments[exps[c]] || {};
+    el.querySelector(".exp").title = "configs: " + ((expInfo.configs || []).join(", ") || "default only") + "\nregistered " + (expInfo.registered || "");
+    const title = el.querySelector(".title"), sub = el.querySelector(".sub"), canvas = el.querySelector(".map");
+    if (!idx || idx.error) {
+      title.textContent = exps[c]; sub.textContent = idx && idx.error ? idx.error : "not available for this scenario/target (run evaluate-target and gallery)";
+      canvas.width = 0; el.querySelector(".cbar").width = 0; columns.push(null); shown.push(null); continue;
+    }
+    const key = [stat, kind, m, w].join("|");
+    const sigKey = sigKeyOf(stat, kind, m, w);
+    const [values, mask] = await Promise.all([load(idx, key), $("dots").checked && sigKey ? load(idx, sigKey, "mask") : null]);
+    if (id !== renderId) return;
+    title.textContent = `${exps[c]} · ${m} · years ${w}`;
+    if (!values) {
+      sub.textContent = "not available: " + key.replace(/\|/g, " ");
+      canvas.width = 0; el.querySelector(".cbar").width = 0; columns.push(null); shown.push(null); continue;
+    }
+    const field = sigKey ? idx.field[sigKey] : null;
+    let line = "area mean " + fmt(G.fieldMean(values, idx.lat, idx.lon.length));
+    if (field && field.field_mean !== null) {
+      const vs = $("dotsref").value === "M1" ? "vs M1" : "vs M0";
+      line += `\n${sigKey.split("|")[0].replace("m1:", "")} ${vs}: field mean ${fmt(field.field_mean)} (p=${field.p_field_mean.toFixed(3)})` +
+              (field.area_fraction_positive !== undefined && field.area_fraction_positive !== null ? `, ${Math.round(100 * field.area_fraction_positive)}% > 0 (p=${field.p_area_fraction.toFixed(3)})` : "");
+    }
+    sub.textContent = (idx.stale ? "⚠ results of earlier settings (rerun the step and pixi run gallery)\n" : "") + line;
+    const grid = {lat: idx.lat, lon: idx.lon};
+    const geo = G.drawMap(canvas, grid, values, {limit, width, mask, coast: idx.coastData});
+    G.drawColorbar(el.querySelector(".cbar"), limit, STAT_LABELS[stat] || stat, width);
+    columns.push({geo, grid, values, el}); shown.push({values, grid, idx, name: `${exps[c]} ${m} ${w}`});
+  }
+  $("defs").innerHTML = definitions(stat, kind, $("tv").value, drawn, $("dots").checked);
+  // difference column
+  const del = document.querySelector(".col.diff");
+  if (del) {
+    const a = shown[0], b = shown[1], title = del.querySelector(".title"), sub = del.querySelector(".sub"), canvas = del.querySelector(".map");
+    if (!a || !b) { title.textContent = "column 1 − column 2"; sub.textContent = "needs two columns with data"; canvas.width = 0; columns.push(null); }
+    else if (a.values.length !== b.values.length || a.grid.lat[0] !== b.grid.lat[0] || a.grid.lon[0] !== b.grid.lon[0]) {
+      title.textContent = "column 1 − column 2"; sub.textContent = "the two columns have different grids"; canvas.width = 0; columns.push(null);
+    } else {
+      const d = new Float32Array(a.values.length);
+      for (let i = 0; i < d.length; i++) d[i] = a.values[i] - b.values[i];
+      const dl = +$("dlimit").value;
+      title.textContent = "column 1 − column 2";
+      sub.textContent = `${a.name} − ${b.name}\narea mean ${fmt(G.fieldMean(d, a.grid.lat, a.grid.lon.length))}`;
+      const geo = G.drawMap(canvas, a.grid, d, {limit: dl, width, coast: a.idx.coastData});
+      G.drawColorbar(del.querySelector(".cbar"), dl, "difference of " + stat, width);
+      columns.push({geo, grid: a.grid, values: d, el: del});
+    }
+  }
+  for (const col of columns) if (col) {
+    const canvas = col.el.querySelector(".map");
+    canvas.onmousemove = ev => hover(col, ev);
+    canvas.onmouseleave = () => columns.forEach(c => c && (c.el.querySelector(".hover").textContent = ""));
+  }
+}
+
+// key of the significance mask: beats M0 (surrogate test; corr/crpss maps use dcorr/dcrpss) or beats M1 (bootstrap)
+function sigKeyOf(stat, kind, m, w) {
+  if ($("dotsref").value === "M1") return ["crpss", "msss_m1"].includes(stat) && m !== "M1" ? "m1:" + [stat, kind, m, w].join("|") : null;
+  return m !== "M0" ? [STIPPLE[stat] || stat, kind, m, w].join("|") : null;
+}
+
+// formula-like definitions of the selected target, methods and statistic (names from the experiment's settings)
+function definitions(stat, kind, tv, used, dots) {
+  const info = (registry.experiments[used[0][0]] || {}).info || {};
+  const spec = (info.targets || {})[tv] || {};
+  const I = (info.primary_index || "index").toUpperCase(), P = (info.lm_predictors || [info.primary_index || "index"]).map(x => x.toUpperCase());
+  const v = spec.cmip6 || "–", L = info.predictor_lag ?? 1, n = info.reference_length || 20, M = info.M || 100;
+  const rel = spec.change === "relative";
+  const forced = spec.forced === "cmip6"
+    ? `F(t,x) = c<sub>0</sub>(x) + c<sub>1</sub>(x)·MMEM<sub>${v}</sub>(t,x)  <span class="muted">(target's own CMIP6 variable, regridded; <code>forced: cmip6</code>)</span>`
+    : `F(t) = c<sub>0</sub>(x) + c<sub>1</sub>(x)·MMEM<sub>${I}</sub>(t−${L})  <span class="muted">(MMEM of the CMIP6 ${I} index; <code>forced: index</code>)</span>`;
+  const methodsUsed = new Set(used.map(u => u[1]));
+  const D = `Δ̂`, W = "W", R = "R";
+  const ana = `the ${M} analogue members (matched on ${Object.keys(info.match_weights || {[I]: 1}).map(x => x.toUpperCase()).join(" + ")}, obs. index: ${info.matching_index || "?"})`;
+  const xbar = ens => `x̄<sub>p</sub> = mean over ${ens} of ${W}<sub>−${L}</sub>[I<sup>int</sup><sub>p,k</sub>]`;
+  const full = kind === "full";
+  const plusF = full ? ` + (${W}[F] − ${R}[F])` : "";
+  const METHODS = {
+    M0: [`${D} = −${R}[obs − F]${plusF}`, `return to the long-term mean (internal anomaly of the reference period vanishes); σ = RMS of its own errors, i.e. of the observed internal window means (non-overlapping inits)`],
+    M1: [`${D} = 0`, `persistence of the reference period (operational method); σ = RMS of the observed changes (non-overlapping inits)`],
+    M0c: [`${D} = mean<sub>t∈T</sub>(obs) − ${R}[obs]`, `observations only (no CMIP6, full target): return to the observed mean; T = ${info.obs_fit === "leave_out" ? "all years except the target window and reference" : "the years up to Y"}; σ = RMS of its own errors (non-overlapping inits)`],
+    M0t: [`${D} = (a + b·t̄<sub>W</sub>) − ${R}[obs],  a + b·t fitted to obs(t), t∈T`, `observations only (no CMIP6, full target): M0 with an observed linear trend as forced part; t̄<sub>W</sub>: centre of the target window; T as for M0c`],
+    M2a: [`${D} = mean<sub>k</sub> ( ${W}[${v}<sub>k</sub>] − ${R}[${v}<sub>k</sub>] )` + (full ? "" : ` − ( ${W}[MMEM<sub>${v}</sub>] − ${R}[MMEM<sub>${v}</sub>] )`), `all CMIP6 members k (model weighting), their own ${v} change; σ = member std` + (full ? "" : "; not shown on the internal target (≡ 0)")],
+    M3a: [`${D} = mean<sub>k∈A</sub> ( ${W}[${v}<sub>k</sub>] − ${R}[${v}<sub>k</sub>] )` + (full ? "" : ` − ( ${W}[MMEM<sub>${v}</sub>] − ${R}[MMEM<sub>${v}</sub>] )`), `A = ${ana}; σ = member std`],
+    M2b: [`${D} = Σ<sub>p</sub> β<sub>p</sub> x̄<sub>p</sub> + α − ${R}[obs − F]${plusF}`, `${xbar("all members k")} (p ∈ {${P.join(", ")}}); σ² = β′Cβ + σ<sub>LM</sub>²`],
+    M3b: [`${D} = Σ<sub>p</sub> β<sub>p</sub> x̄<sub>p</sub> + α − ${R}[obs − F]${plusF}`, `${xbar("the analogue members A")}; σ² = β′Cβ + σ<sub>LM</sub>²`],
+    M2b_b: [`${D} = Σ<sub>p</sub> β<sub>p</sub> x̄<sub>p</sub> + α − ${R}[obs − F] + ( ${W}[MMEM<sub>${v}</sub>] − ${R}[MMEM<sub>${v}</sub>] )`, `as M2b, forced part from the CMIP6 ${v} MMEM (option b)`],
+    M3b_b: [`${D} = Σ<sub>p</sub> β<sub>p</sub> x̄<sub>p</sub> + α − ${R}[obs − F] + ( ${W}[MMEM<sub>${v}</sub>] − ${R}[MMEM<sub>${v}</sub>] )`, `as M3b, forced part from the CMIP6 ${v} MMEM (option b)`],
+    perfect_index: [`${D} = Σ<sub>p</sub> β<sub>p</sub> ${W}<sub>−${L}</sub>[I<sup>int</sup><sub>p,obs</sub>] + α − ${R}[obs − F]${plusF}`, `the linear model given the observed index in the target window (upper limit, not a forecast)`],
+  };
+  const STATS = {
+    corr: `corr<sub>Y</sub>( ${D}, Δ )`,
+    crpss: `1 − CRPS(m) / CRPS(M1),  predictions N(${D}, σ²)`,
+    msss_m1: `1 − mean<sub>Y</sub>(${D} − Δ)² / mean<sub>Y</sub>(Δ²)  <span class="muted">(Δ̂<sub>M1</sub> = 0; > 0: better than persistence in the mean-squared error)</span>`,
+    dcorr: `corr<sub>Y</sub>(${D}<sub>m</sub>, Δ) − corr<sub>Y</sub>(${D}<sub>M0</sub>, Δ)`,
+    dcrpss: `CRPSS(m) − CRPSS(M0) = ( CRPS(M0) − CRPS(m) ) / CRPS(M1)`,
+    corr_anom: `corr<sub>Y</sub>( ${D}<sub>m</sub> − ${D}<sub>M0</sub>,  Δ − ${D}<sub>M0</sub> )  <span class="muted">(information beyond the return to the mean)</span>`,
+  };
+  const target = full ? `Δ = ${W}[obs] − ${R}[obs]` : `Δ = ${W}[obs − F] − ${R}[obs − F]`;
+  const row = (k, f, note, sel) => `<tr class="${sel ? "sel" : ""}"><td>${k}</td><td class="f">${f}</td><td class="muted">${note || ""}</td></tr>`;
+  let h = `<div class="muted">Y: init year, window a–b in lead years. ${W}[·]: mean over the years Y+a … Y+b; ${W}<sub>−${L}</sub>[·]: the index seasons Y+a−${L} … Y+b−${L}
+    (season t−${L} predicts year t); ${R}[·]: mean over the ${n} years Y−${n - 1} … Y. obs: observed ${tv}${rel ? "; all changes in % of R[obs] (×100/R[obs])" : ` (absolute change)`}.
+    I<sup>int</sup>: internal index (forced part, the scaled MMEM, removed). Coefficients fitted without the target window and reference period.</div>`;
+  h += `<h4>Target (${kind})</h4><table>${row(tv, target, "", true)}${full ? "" : row("F", forced, "", true)}</table>`;
+  h += `<h4>Method${methodsUsed.size > 1 ? "s" : ""} shown</h4><table>${[...methodsUsed].map(m => METHODS[m] ? row(m, METHODS[m][0], METHODS[m][1], true) : "").join("")}</table>`;
+  const sigStat = {corr: "dcorr", crpss: "dcrpss", dcorr: "dcorr", dcrpss: "dcrpss", corr_anom: "corr_anom"}[stat];
+  const vsM1 = $("dotsref").value === "M1";
+  const dotNote = !dots ? "" : vsM1
+    ? (["crpss", "msss_m1"].includes(stat) ? `dots: points where ${stat} > 0 is significant, i.e. m beats M1 (one-sided paired moving-block bootstrap over the init years, FDR)` : "no M1 test for this statistic (only crpss and msss_m1)")
+    : (sigStat ? `dots: points where ${sigStat} > 0 is significant, i.e. m beats M0 (one-sided test against 1000 phase-randomized surrogates of the observed internal target, FDR)` : "");
+  h += `<h4>Statistic</h4><table>${row(stat, STATS[stat] || stat, dotNote, true)}</table>`;
+  h += `<details><summary class="muted">all methods</summary><table>${Object.entries(METHODS).map(([m, [f, nte]]) => row(m, f, nte, methodsUsed.has(m))).join("")}</table></details>`;
+  return h;
+}
+
+// value under the mouse in every column (nearest grid point of each column's own grid)
+function hover(src, ev) {
+  const p = G.pick(src.geo, src.grid, ev);
+  for (const c of columns) {
+    if (!c) continue;
+    const out = c.el.querySelector(".hover");
+    if (!p) { out.textContent = ""; continue; }
+    const i = Math.round((p.lon - c.grid.lon[0]) / c.geo.dlon), j = Math.round((p.lat - c.grid.lat[0]) / c.geo.dlat);
+    const v = (i >= 0 && j >= 0 && i < c.grid.lon.length && j < c.grid.lat.length) ? c.values[j * c.grid.lon.length + i] : NaN;
+    out.textContent = `${p.lat.toFixed(2)}°N ${p.lon.toFixed(2)}°E: ${fmt(v, 3)}`;
+  }
+}
+
+async function main() {
+  try { registry = await G.json("experiments.json"); }
+  catch (e) { $("cols").textContent = "No experiments registered yet (pixi run gallery --config ...)."; return; }
+  state.ncol = Math.max(1, Math.min(4, +state.ncol || Math.min(2, Object.keys(registry.experiments).length)));
+  for (const k of SHARED) if (state[k]) $(k).dataset.v = state[k];
+  if (state.limit) $("limit").value = state.limit;
+  if (state.dlimit) $("dlimit").value = state.dlimit;
+  $("dots").checked = state.dots !== "0";
+  G.select($("dotsref"), [["M0", "M0 (information beyond M0)"], ["M1", "M1 (better than persistence)"]], state.dotsref || "M0");
+  $("dotsref").onchange = render;
+  $("diff").checked = state.diff === "1";
+  G.select($("width"), [["360", "small"], ["480", "medium"], ["640", "large"], ["900", "very large"]], state.width || "480");
+  for (const k of SHARED) $(k).onchange = () => { state[k] = $(k).value; if (k === "stat") $("limit").value = ""; $("dlimit").value = k === "stat" ? "" : $("dlimit").value; render(); };
+  for (const k of ["limit", "dlimit", "dots", "width"]) $(k).onchange = render;
+  $("diff").onchange = () => { buildColumns(); render(); };
+  $("add").onclick = () => { if (state.ncol < 4) { state.ncol++; buildColumns(); render(); } };
+  $("remove").onclick = () => { if (state.ncol > 1) { state.ncol--; buildColumns(); render(); } };
+  buildColumns();
+  render();
+}
+main();
+</script>
+</body>
+</html>

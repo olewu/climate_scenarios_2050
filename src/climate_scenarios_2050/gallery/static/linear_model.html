@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Linear model comparison</title>
+<link rel="stylesheet" href="gallery.css">
+</head>
+<body>
+<nav><a href="index.html">Gallery</a><a href="index_skill.html">Index skill</a><a href="linear_model.html">Linear model</a><a href="target.html">Target skill</a><a href="partition.html">Partition</a></nav>
+<h1>Linear model comparison</h1>
+<div class="note">Maps of the linear model (linear-model step, hindcast scenarios). <b>corr / 1 − RMSE/std</b>: skill of the
+  predicted internal target change given the <i>observed</i> index change (slope × (index window mean − reference mean); no
+  reversion to the mean, unlike perfect_index of the target evaluation). <b>change per 1 std</b>: mean slope over the
+  init years × the std of the window-mean observed internal training index, in target units or % of the mean. Each
+  column shows one experiment; the window can be changed per column.</div>
+
+<div class="bar">
+  <label>Scenario<select id="scenario"></select></label>
+  <label>Target<select id="tv"></select></label>
+  <label>Field<select id="field"></select></label>
+  <label>Window (lead years)<select id="window"></select></label>
+  <label>Colour limit<input id="limit" type="number" step="0.05" min="0.01"></label>
+  <label class="check"><input id="diff" type="checkbox">difference: column 1 − column 2</label>
+  <label>Diff. limit<input id="dlimit" type="number" step="0.05" min="0.01"></label>
+  <label>Map width<select id="width"></select></label>
+  <span><button id="add">+ column</button> <button id="remove">− column</button></span>
+</div>
+<details class="defs" open><summary>Definitions of the current selection</summary><div id="defs"></div></details>
+<div class="cols" id="cols"></div>
+
+<script src="gallery.js"></script>
+<script>
+"use strict";
+const WINDOW_ORDER = ["1-5", "6-10", "11-15", "16-20", "21-25", "26-30", "1-10", "11-20", "21-30", "1-20", "11-30"];
+const $ = id => document.getElementById(id);
+const SHARED = ["scenario", "tv", "field", "window"];
+let registry = null, state = G.readHash(), coastCache = {}, columns = [];
+
+function fieldLabel(f, units) {
+  if (f === "corr") return "corr given obs. index change";
+  if (f === "nrmse") return "1 − RMSE/std given obs. index change";
+  const [kind, pred] = f.split(":");
+  return `change per 1 std ${pred} [${kind === "change_pct" ? "%" : units || "units"}]`;
+}
+function fmt(v, d = 2) { return v === null || v === undefined || Number.isNaN(v) ? "–" : (v >= 0 ? "+" : "") + v.toFixed(d); }
+
+async function exportIndex(exp) {
+  const c = (((registry.experiments[exp] || {}).linear_model) || {})[$("scenario").value + "|" + $("tv").value];
+  if (!c) return null;
+  const idx = await G.json("data/" + c.export + ".json");
+  idx.url = "data/" + c.export + ".bin";
+  idx.stale = !!c.stale;
+  if (!coastCache[idx.coast]) coastCache[idx.coast] = G.json("data/" + idx.coast);
+  idx.coastData = await coastCache[idx.coast];
+  return idx;
+}
+async function loadMap(idx, key) {
+  const e = idx && idx.maps[key];
+  return e ? G.decode(await G.range(idx.url, e[0], e[1]), idx.scale, idx.missing) : null;
+}
+
+function save() {
+  const s = {};
+  for (const k of SHARED) s[k] = $(k).value;
+  s.limit = $("limit").value; s.dlimit = $("dlimit").value; s.diff = $("diff").checked ? 1 : 0; s.width = $("width").value; s.ncol = state.ncol;
+  for (let c = 0; c < state.ncol; c++) for (const k of ["exp", "window"]) s["c" + c + k] = state["c" + c + k];
+  state = {...state, ...s};
+  G.writeHash(s);
+}
+
+function buildColumns() {
+  const wrap = $("cols"); wrap.innerHTML = "";
+  const names = Object.keys(registry.experiments).filter(n => Object.keys(registry.experiments[n].linear_model || {}).length).sort();
+  for (let c = 0; c < state.ncol; c++) {
+    const el = document.createElement("div"); el.className = "col";
+    el.innerHTML = `<div class="head"><label>Experiment<select class="exp"></select></label><label>Window<select class="window"></select></label></div>
+      <div class="title"></div><div class="sub"></div><canvas class="map"></canvas><canvas class="cbar"></canvas><div class="hover"></div>`;
+    wrap.appendChild(el);
+    const exp = el.querySelector(".exp");
+    G.select(exp, names, state["c" + c + "exp"] || names[Math.min(c, names.length - 1)]);
+    state["c" + c + "exp"] = exp.value;
+    exp.onchange = () => { state["c" + c + "exp"] = exp.value; render(); };
+    el.querySelector(".window").onchange = ev => { state["c" + c + "window"] = ev.target.value; render(); };
+  }
+  if ($("diff").checked) {
+    const el = document.createElement("div"); el.className = "col diff";
+    el.innerHTML = `<div class="head"><label>Difference</label></div><div class="title"></div><div class="sub"></div><canvas class="map"></canvas><canvas class="cbar"></canvas><div class="hover"></div>`;
+    wrap.appendChild(el);
+  }
+}
+
+let renderId = 0;
+async function render() {
+  const id = ++renderId;
+  const els = [...document.querySelectorAll(".col")];
+  const exps = els.filter(e => !e.classList.contains("diff")).map((e, c) => state["c" + c + "exp"]);
+  const cases = new Set();
+  for (const e of exps) for (const k of Object.keys((registry.experiments[e] || {}).linear_model || {})) cases.add(k);
+  G.select($("scenario"), [...new Set([...cases].map(k => k.split("|")[0]))].sort(), state.scenario);
+  G.select($("tv"), [...new Set([...cases].map(k => k.split("|")[1]))], state.tv);
+  const idxs = await Promise.all(exps.map(e => exportIndex(e).catch(err => ({error: err.message}))));
+  if (id !== renderId) return;
+  const good = idxs.filter(i => i && !i.error);
+  const keys = good.flatMap(i => Object.keys(i.maps).map(k => k.split("|")));
+  const fields = [...new Set(keys.map(k => k[0]))].sort((a, b) => (a.includes(":") - b.includes(":")) || (a < b ? -1 : 1));
+  const units = good.length ? good[0].units : "";
+  const field = G.select($("field"), fields.map(f => [f, fieldLabel(f, units)]), state.field);
+  const windows = [...new Set(keys.filter(k => k[0] === field).map(k => k[1]))].sort((a, b) => WINDOW_ORDER.indexOf(a) - WINDOW_ORDER.indexOf(b));
+  const window_ = G.select($("window"), windows, state.window);
+  // default limit: the largest of the columns' robust limits (same scale in all columns)
+  const auto = Math.max(...good.map(i => i.limits[field] || 0), 0) || 1;
+  if (state.field !== field || !$("limit").value) $("limit").value = +auto.toPrecision(2);
+  if (state.field !== field || !$("dlimit").value) $("dlimit").value = +(auto / 2).toPrecision(2);
+  state.field = field;
+  const limit = +$("limit").value, width = +$("width").value;
+  save();
+
+  columns = []; const shown = [];
+  for (let c = 0; c < exps.length; c++) {
+    const el = els[c], idx = idxs[c];
+    const w = G.select(el.querySelector(".window"), [["", "(shared)"], ...windows], state["c" + c + "window"] || "") || window_;
+    const info = registry.experiments[exps[c]] || {};
+    el.querySelector(".exp").title = "configs: " + ((info.configs || []).join(", ") || "default only");
+    const title = el.querySelector(".title"), sub = el.querySelector(".sub"), canvas = el.querySelector(".map");
+    const missing = msg => { sub.textContent = msg; canvas.width = 0; el.querySelector(".cbar").width = 0; columns.push(null); shown.push(null); };
+    title.textContent = `${exps[c]} · years ${w}`;
+    if (!idx || idx.error) { missing(idx && idx.error ? idx.error : "not available for this scenario/target"); continue; }
+    const values = await loadMap(idx, `${field}|${w}`);
+    if (id !== renderId) return;
+    if (!values) { missing(`not available: ${field} ${w} (predictors: ${idx.predictors.join(", ")})`); continue; }
+    let line = `model: ${$("tv").value} ~ ${idx.predictors.join(" + ")} · ${idx.n_inits} inits\narea mean ${fmt(G.fieldMean(values, idx.lat, idx.lon.length))}`;
+    const pred = field.split(":")[1];
+    if (pred && idx.index_std[pred]) line += ` · std of the ${w} index mean: ${idx.index_std[pred][w].toFixed(2)}`;
+    sub.textContent = (idx.stale ? "⚠ results of earlier settings (rerun the step and pixi run gallery)\n" : "") + line;
+    const grid = {lat: idx.lat, lon: idx.lon};
+    const geo = G.drawMap(canvas, grid, values, {limit, width, coast: idx.coastData});
+    G.drawColorbar(el.querySelector(".cbar"), limit, fieldLabel(field, idx.units), width);
+    columns.push({geo, grid, values, el}); shown.push({values, grid, idx, name: `${exps[c]} ${w}`});
+  }
+  $("defs").innerHTML = definitions(field, $("tv").value, exps[0]);
+  const del = document.querySelector(".col.diff");
+  if (del) {
+    const a = shown[0], b = shown[1], title = del.querySelector(".title"), sub = del.querySelector(".sub"), canvas = del.querySelector(".map");
+    title.textContent = "column 1 − column 2";
+    if (!a || !b || a.values.length !== b.values.length || a.grid.lat[0] !== b.grid.lat[0] || a.grid.lon[0] !== b.grid.lon[0]) {
+      sub.textContent = !a || !b ? "needs two columns with data" : "the two columns have different grids"; canvas.width = 0; columns.push(null);
+    } else {
+      const d = new Float32Array(a.values.length);
+      for (let i = 0; i < d.length; i++) d[i] = a.values[i] - b.values[i];
+      const dl = +$("dlimit").value;
+      sub.textContent = `${a.name} − ${b.name}\narea mean ${fmt(G.fieldMean(d, a.grid.lat, a.grid.lon.length))}`;
+      const geo = G.drawMap(canvas, a.grid, d, {limit: dl, width, coast: a.idx.coastData});
+      G.drawColorbar(del.querySelector(".cbar"), dl, "difference", width);
+      columns.push({geo, grid: a.grid, values: d, el: del});
+    }
+  }
+  for (const col of columns) if (col) {
+    const canvas = col.el.querySelector(".map");
+    canvas.onmousemove = ev => hover(col, ev);
+    canvas.onmouseleave = () => columns.forEach(c => c && (c.el.querySelector(".hover").textContent = ""));
+  }
+}
+
+function definitions(field, tv, exp) {
+  const info = (registry.experiments[exp] || {}).info || {};
+  const spec = (info.targets || {})[tv] || {}, L = info.predictor_lag ?? 1, n = info.reference_length || 20;
+  const P = (info.lm_predictors || [info.primary_index || "index"]).map(x => x.toUpperCase()), tr = info.training_index || "ERA5";
+  const forced = spec.forced === "cmip6" ? `c<sub>0</sub> + c<sub>1</sub>·MMEM<sub>${spec.cmip6}</sub>(t)` : `c<sub>0</sub> + c<sub>1</sub>·MMEM<sub>${(info.primary_index || "index").toUpperCase()}</sub>(t−${L})`;
+  const row = (k, f, note, sel) => `<tr class="${sel ? "sel" : ""}"><td>${k}</td><td class="f">${f}</td><td class="muted">${note || ""}</td></tr>`;
+  const pred = field.split(":")[1], kind = field.split(":")[0];
+  const FIELDS = {
+    corr: [`corr<sub>Y</sub>( Σ<sub>p</sub> β<sub>p</sub> (W<sub>−${L}</sub>[I<sub>p</sub>] − R<sub>−${L}</sub>[I<sub>p</sub>]),  W[y] − R[y] )`, "skill given the observed index change (no reversion to the mean included)"],
+    nrmse: [`1 − RMSE / std<sub>Y</sub>(W[y] − R[y]),  prediction as for corr`, "0: as good as the mean observed change"],
+    change: [`mean<sub>Y</sub>(β<sub>p</sub>) · std( W[I<sub>p</sub>] )`, `target change for a typical (1 std) anomaly of the window-mean ${pred ? pred.toUpperCase() : "index"} (sliding windows of the observed internal ${tr} index, full-period split), in ${spec.change === "relative" ? "target units" : "target units"}`],
+    change_pct: [`mean<sub>Y</sub>(β<sub>p</sub>) · std( W[I<sub>p</sub>] ) · 100 / mean(obs)`, "the same in % of the long-term mean of the target"],
+  };
+  let h = `<div class="muted">Linear model per grid point and window length: W[y] = Σ<sub>p</sub> β<sub>p</sub> W<sub>−${L}</sub>[I<sub>p</sub>] + α + ε, σ<sub>LM</sub> = std(ε);
+    y = obs − F, the observed internal ${tv} (F = ${forced}); I<sub>p</sub>: observed internal ${tr} index, p ∈ {${P.join(", ")}};
+    W[·]: target-window mean (years Y+a … Y+b), W<sub>−${L}</sub>: index seasons shifted by ${L}; R[·]: the ${n} years up to Y.
+    Fitted for every init year Y on all sliding windows of the same length that do not overlap the target window
+    (<code>linear_model.leave_out: overlap_target</code>); the maps average over the ${n ? "" : ""}init years.</div>`;
+  h += `<table>${row(field, (FIELDS[kind] || ["", ""])[0], (FIELDS[kind] || ["", ""])[1], true)}</table>`;
+  h += `<details><summary class="muted">all fields</summary><table>${Object.entries(FIELDS).map(([k, [f, nte]]) => row(k, f, nte, k === kind)).join("")}</table></details>`;
+  return h;
+}
+
+function hover(src, ev) {
+  const p = G.pick(src.geo, src.grid, ev);
+  for (const c of columns) {
+    if (!c) continue;
+    const out = c.el.querySelector(".hover");
+    if (!p) { out.textContent = ""; continue; }
+    const i = Math.round((p.lon - c.grid.lon[0]) / c.geo.dlon), j = Math.round((p.lat - c.grid.lat[0]) / c.geo.dlat);
+    const v = (i >= 0 && j >= 0 && i < c.grid.lon.length && j < c.grid.lat.length) ? c.values[j * c.grid.lon.length + i] : NaN;
+    out.textContent = `${p.lat.toFixed(2)}°N ${p.lon.toFixed(2)}°E: ${fmt(v, 3)}`;
+  }
+}
+
+async function main() {
+  try { registry = await G.json("experiments.json"); }
+  catch (e) { $("cols").textContent = "No experiments registered yet (pixi run gallery --config ...)."; return; }
+  state.ncol = Math.max(1, Math.min(4, +state.ncol || 2));
+  if (state.limit) $("limit").value = state.limit;
+  if (state.dlimit) $("dlimit").value = state.dlimit;
+  $("diff").checked = state.diff === "1";
+  G.select($("width"), [["360", "small"], ["480", "medium"], ["640", "large"], ["900", "very large"]], state.width || "480");
+  for (const k of SHARED) $(k).onchange = () => { state[k] = $(k).value; if (k === "field") { $("limit").value = ""; $("dlimit").value = ""; } render(); };
+  for (const k of ["limit", "dlimit", "width"]) $(k).onchange = render;
+  $("diff").onchange = () => { buildColumns(); render(); };
+  $("add").onclick = () => { if (state.ncol < 4) { state.ncol++; buildColumns(); render(); } };
+  $("remove").onclick = () => { if (state.ncol > 1) { state.ncol--; buildColumns(); render(); } };
+  buildColumns(); render();
+}
+main();
+</script>
+</body>
+</html>

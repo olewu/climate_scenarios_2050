@@ -1,7 +1,7 @@
 """
 Forecast at one site: violins of the predictive distribution of each method, per window and scenario
 (design of the old `make_vio_plot`). Each distribution is a Gaussian mixture (see
-`forecast.site_components`): one Gaussian for M0/M1, the members' Gaussians for M2b/M3b, a weighted
+`forecast.site_components`): one Gaussian for M0/M1/M0c/M0t, the members' Gaussians for M2b/M3b, a weighted
 kernel density of the member changes for M2a/M3a. Medians as horizontal bars, 5-95 % as thin lines,
 the observed change (if the window lies in the record) dashed.
 """
@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.special import ndtr
 
-COLORS = {"M0": "0.35", "M1": "0.7", "M2a": "C1", "M2b": "C3", "M3a": "C2", "M3b": "C0"}
+COLORS = {"M0": "0.35", "M1": "0.7", "M0c": "C5", "M0t": "C4", "M2a": "C1", "M2b": "C3", "M3a": "C2", "M3b": "C0"}
 
 
 def mixture_density(mu, sigma, w, grid):

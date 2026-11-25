@@ -134,3 +134,35 @@ def test_lowpass_pad_and_nans():
     for pad in [None, 2, 3, 10]:  # even pads were rejected by the old filter
         y = lowpass(x, 10, pad=pad)
         assert np.isnan(y[:5]).all() and np.isfinite(y[5:]).all()
+
+
+def test_pointwise_fit_recovers_each_points_coefficients():
+    """forced: cmip6 - every point is fitted on its own regressor, gaps and too short series handled"""
+    years = np.arange(1940, 2025)
+    rng = np.random.default_rng(7)
+    field = xr.DataArray(np.cumsum(rng.standard_normal((len(years), 2, 3)), axis=0), dims=("year", "latitude", "longitude"),
+                         coords={"year": years, "latitude": [50.0, 60.0], "longitude": [0.0, 10.0, 20.0]})
+    slopes = xr.DataArray([[0.5, 1.0, 1.5], [2.0, -1.0, 0.0]], dims=("latitude", "longitude"))
+    y = (3.0 + slopes * field).transpose("year", "latitude", "longitude") + 0.01 * rng.standard_normal(field.shape)
+    y[:10, 0, 0] = np.nan                      # a point with missing years: fitted on its own years
+    y[:, 1, 2] = np.nan                        # no data
+    design = fc.pointwise_design(field, years)
+    assert design.dims == ("year", "term", "latitude", "longitude")
+    coef = fc.fit_coefficients(y, design, fc.full_period_exclusions(years), 15)
+    np.testing.assert_allclose(coef.sel(term="mmem_cmip6").values.ravel()[:5], slopes.values.ravel()[:5], atol=0.01)
+    # the regressor is centred: intercept = 3 + slope * mean of the field
+    expected = (3.0 + slopes * field.mean("year")).values.ravel()[:5]
+    np.testing.assert_allclose(coef.sel(term="intercept").values.ravel()[:5], expected, atol=0.05)
+    assert np.isnan(coef.isel(latitude=1, longitude=2)).all()
+    internal = y - fc.forced_part(design, coef)
+    assert float(abs(internal).max()) < 0.1
+    # leave-out cases: excluded years do not influence the fit
+    excl = fc.window_exclusions(years, [1970], [(1, 10)], lag=0, reference_length=20)
+    y2 = y.copy()
+    y2.loc[dict(year=slice(1971, 1980))] += 100
+    a = fc.fit_coefficients(y, design, excl, 15).isel(init_year=0, window=0)
+    b = fc.fit_coefficients(y2, design, excl, 15).isel(init_year=0, window=0)
+    np.testing.assert_allclose(a.values, b.values)
+    # numpy application matches xarray
+    flat = fc.forced_values(design.values.reshape(len(years), 2, -1), coef.values.reshape(2, -1))
+    np.testing.assert_allclose(flat.reshape(y.shape), fc.forced_part(design, coef).transpose("year", "latitude", "longitude").values)

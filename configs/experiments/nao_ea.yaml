@@ -3,7 +3,8 @@
 predictor:
   indices:
     nao: {mode: 1}
-    ea: {mode: 2, sign_reference_point: {lat: 55, lon: -20, sign: negative}}   # EA+: low pressure west of the British Isles (CPC)
+    # EA+: low pressure west of the British Isles (CPC); the DCPP marker of the default is for the NAO
+    ea: {mode: 2, sign_reference_point: {lat: 55, lon: -20, sign: negative}, reference_skill: null}
 
 analogues:
   match_weights: {nao: 0.5, ea: 0.5}

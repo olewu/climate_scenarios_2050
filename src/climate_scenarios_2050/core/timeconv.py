@@ -34,10 +34,13 @@ def season_labels(time: xr.DataArray, months: list) -> xr.DataArray:
     return xr.where(month >= first_month, year, year - 1).rename("year")
 
 
-def seasonal_mean(da: xr.DataArray, months: list, time_dim: str = "time", weighted: bool = True) -> xr.DataArray:
+def seasonal_mean(da: xr.DataArray, months: list, time_dim: str = "time", weighted: bool = True, min_months: int = None) -> xr.DataArray:
     """
     day-weighted mean over the months of a season for each season year; seasons with missing
-    months (or NaN in any month) are dropped/NaN, so partial seasons never enter
+    months (or NaN in any month) are dropped/NaN, so partial seasons never enter.
+    `min_months`: instead, the mean over the valid months of a point where at least this many are valid
+    (only for anomaly data without a seasonal cycle, e.g. sparse SST reconstructions); seasons missing
+    from the time axis are still dropped
     """
     da = da.isel({time_dim: da[time_dim].dt.month.isin(months).values})
     labels = season_labels(da[time_dim], months)
@@ -48,11 +51,17 @@ def seasonal_mean(da: xr.DataArray, months: list, time_dim: str = "time", weight
     weights = weights.assign_coords(year=labels)
     da = da.assign_coords(year=labels)
 
-    weighted_sum = (da * weights).groupby("year").sum(time_dim, skipna=False)
-    weight_sum = weights.groupby("year").sum(time_dim)
     n_months = labels.groupby(labels).count()
-
-    seas = weighted_sum / weight_sum
+    if min_months is None:
+        weighted_sum = (da * weights).groupby("year").sum(time_dim, skipna=False)
+        weight_sum = weights.groupby("year").sum(time_dim)
+        seas = weighted_sum / weight_sum
+    else:
+        valid = da.notnull()
+        weighted_sum = (da.fillna(0) * weights).groupby("year").sum(time_dim)
+        weight_sum = (valid * weights).groupby("year").sum(time_dim)
+        n_valid = valid.groupby("year").sum(time_dim)
+        seas = (weighted_sum / weight_sum).where(n_valid >= min_months)
     complete = n_months.values == len(months)
     return seas.isel(year=complete)
 

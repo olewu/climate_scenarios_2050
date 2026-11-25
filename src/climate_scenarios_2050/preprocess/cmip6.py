@@ -47,7 +47,13 @@ VARIANT_PATTERN = re.compile(r"_(r\d+i\d+p\d+f\d+)_")
 HIST_END = 2014
 DOMAIN_MARGIN = 5.0  # degrees added around the target domain before regridding
 GRID_TOLERANCE = 0.01  # degrees, largest accepted coordinate difference between files of a member
+LEVEL_COORDS = {"plev", "height"}  # level of a single-level field: metadata, dropped when the models are joined
 ZERO_ALLOWED = {"pr", "tos"}  # variables where exact zeros are physical (otherwise a sign of unmapped cells)
+# value checks of the native data per variable (recorded in the store hash): `zero_missing` (INM fills levels
+# below the ground with 0), `fill_missing` (undecoded 1e20 fill values), `max_abs` (larger values are
+# corrupt: NaN, and the member is dropped if a time step has more than `max_bad_share` of such points).
+# The ua subsets (OPeNDAP) contain blocks and single points of ~1e37 garbage and 1e20 fill values.
+VALUE_CHECKS = {"ua": {"zero_missing": True, "fill_missing": True, "max_abs": 150.0, "max_bad_share": 0.01}}
 
 
 #---------------grids--------------#
@@ -298,6 +304,9 @@ def load_member_monthly(files: dict, variable: str, scenario: str, period, domai
         return None, "gaps in the monthly series"
 
     da = cut_native(ds, domain)[variable].load()
+    da, problem = check_values(da, variable)
+    if problem:
+        return None, problem
     if da.isnull().all(dim=[d for d in da.dims if d != "time"]).any():
         return None, "time steps without any data"
     info = {
@@ -309,6 +318,25 @@ def load_member_monthly(files: dict, variable: str, scenario: str, period, domai
         native = ds[variable]
         info["global_mean"] = global_mean(native, mask_for(native) if mask_for else None).load()
     return da, info
+
+
+def check_values(da: xr.DataArray, variable: str):
+    """`VALUE_CHECKS` of a native member field: (field with missing/corrupt points as NaN, None) or (None, reason)"""
+    rules = VALUE_CHECKS.get(variable)
+    if not rules:
+        return da, None
+    if rules.get("zero_missing"):
+        da = da.where(da != 0)
+    if rules.get("fill_missing"):
+        da = da.where(np.abs(da - 1e20) > 1e14)
+    if rules.get("max_abs"):
+        space = [d for d in da.dims if d != "time"]
+        bad = np.abs(da) > rules["max_abs"]
+        share = float(bad.mean(space).max())
+        if share > rules["max_bad_share"]:
+            return None, f"corrupt time steps (|{variable}| > {rules['max_abs']:g} in {share:.0%} of the points)"
+        da = da.where(~bad)
+    return da, None
 
 
 #---------------regridding--------------#
@@ -354,6 +382,8 @@ def field_store(cfg, field: str, aggregation: str) -> Path:
         record["table"] = cmip6_table(cfg, variable)
     if field != variable:
         record["field"] = field
+    if variable in VALUE_CHECKS:
+        record["value_checks"] = VALUE_CHECKS[variable]
     return Path(cfg["paths"]["outputs"]["cmip6_processed"]) / f"{field}_{aggregation}" / config_hash(record), record
 
 
@@ -479,10 +509,12 @@ def _open_model(path) -> xr.Dataset:
     one model's archive, with its member coordinates in memory and without the on-disk encoding: a
     string width kept in the encoding (<U10) would cut longer names of other models when the joined
     data is written (m12 -> m1, MPI-ESM1-2-HR -> MPI-ESM1-2).
-    Scalar coordinates that only some models have (e.g. `height` of sfcWind) are dropped.
+    Scalar coordinates that only some models have (e.g. `height` of sfcWind, `plev` of ua) are dropped,
+    also when the members' values differ by rounding and the coordinate got a member dimension
+    (ACCESS: plev 85000 and 85000.00000001).
     """
     ds = xr.open_zarr(path)
-    ds = ds.drop_vars([name for name in ds.coords if ds[name].ndim == 0])
+    ds = ds.drop_vars([name for name in ds.coords if ds[name].ndim == 0 or name in LEVEL_COORDS])
     ds = ds.assign_coords({name: ds[name].load() for name in ds.coords if name not in ds.dims})
     return ds.reset_encoding()
 

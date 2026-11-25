@@ -1,0 +1,45 @@
+# Atlantic Multidecadal Variability (AMV) as predictor: annual-mean near-surface temperature over the North
+# Atlantic ocean (0-60N, 80W-0, Trenberth and Shea 2006 box), area-weighted mean of the anomalies,
+# standardized with the DCENT normal-period std. CMIP6: tas (tos is not in the archive); observations: DCENT
+# (blended SST/LSAT, ocean points only via the ERA5 land-sea mask), 1850-2025, no merge.
+#
+# Forced part: as for every index in the split - each model's mean and DCENT are regressed on the AMV MMEM
+# (y = c0 + c1 * MMEM, leave-out cases as for the NAO); no detrending of the index itself. Variant: subtract
+# the global-mean (ocean) tas first (`predictor.remove_global_mean: true`, Trenberth and Shea 2006; the
+# field already stores the global mean, so only the indices are recomputed).
+#
+# Preprocessing (new CMIP6 field tas_na, all models/scenarios):
+#   pixi run preprocess --config configs/experiments/amv.yaml
+# then the steps from `split` on with the same --config.
+preprocess:
+  fields:
+    tas_na:
+      variable: tas
+      method: bilinear
+      aggregations: {annual: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]}
+      domain: {lon: [-85, 5], lat: [-5, 65]}   # the AMV box plus 5 deg
+      global_mean: ocean
+
+predictor:
+  name: amv
+  method: amv
+  variable: tas
+  field: tas_na
+  aggregation: annual
+  domain: {lon: [-80, 0], lat: [0, 60]}
+  mask: ocean
+  obs_datasets: [DCENT]
+  pattern_source: DCENT                # reference dataset of the standardization
+  remove_global_mean: false
+  sign_reference_point: null
+  reference_skill: null                # no DCPP reference marker
+  amv: {min_coverage: 0.5}             # share of the box area a year needs valid data at (DCENT gaps)
+
+obs:
+  matching_index: DCENT
+  training_index: DCENT
+  merge: null
+
+
+synthetic_null:
+  enabled: false

@@ -17,10 +17,14 @@ every (init, window) the internal window mean and reference mean are fixed linea
 (window operator minus the forced part fitted without those years) applied to the annual series;
 applying them to d repeats the leave-out split for every surrogate (excluded years keep their
 anomaly, which raises the correlation of reference and window means and has to be in the null too):
-  target*  = target + (WL d - RL d) * to_units
+  target*  = target + (WL d - RL d) * to_units   (internal target)
+  target*  = target + (W d - R d) * to_units     (full target: plain window and reference means, obs* = obs + d)
   pred_m*  = pred_m - c_m * RL d * to_units, c_m = 1 for the methods subtracting the observed
              internal reference (M0, M2b, M3b, *_b, perfect_index), 0 for M1, M2a, M3a
-  M1 spread recomputed from target* (also the CRPSS reference)
+  pred_m*  = pred_m + O_m d * to_units for the observations-only methods M0c/M0t (their own linear
+             operators, `evaluate.target.observation_reference_operators`)
+  M1, M0c, M0t (and M0 with `evaluation.m0_spread: own_errors`) spreads recomputed from target* and pred*
+  (RMS of the errors over the non-overlapping samples; M1 is also the CRPSS reference)
 With d = 0 this reproduces the actual scores. The regression parameters of the linear model are
 kept fixed (the test is conditional on the predictions), as is the conversion to % (to_units).
 
@@ -49,6 +53,8 @@ from climate_scenarios_2050.split.run import SplitResults
 log = logging.getLogger(__name__)
 
 STATISTICS = ["dcrpss", "dcorr", "corr_anom"]
+METHOD_ORDER = ["M0", "M1", "M0c", "M0t", "M2a", "M3a", "M2b", "M3b", "M2b_b", "M3b_b", "perfect_index"]
+OBS_METHODS = ("M0c", "M0t")
 # methods whose prediction contains "- observed internal reference"
 WITH_REFERENCE = {"M0", "M2b", "M3b", "M2b_b", "M3b_b", "perfect_index"}
 
@@ -108,28 +114,76 @@ def leave_out_operators(win, ref, design: np.ndarray, excluded: np.ndarray, min_
     return win_lo, ref_lo
 
 
-def observation_operators(cfg, scenario, years, init_years, windows):
-    """operators for the observed internal window and reference means as used in the evaluation"""
+def leave_out_operators_pointwise(win, ref, design: np.ndarray, excluded: np.ndarray, min_fit_years: int):
+    """
+    `leave_out_operators` for a design with a regressor per point, design (year, term, point):
+    operators (init, window, year, point), float32. Row of a case and point: a - [keep] X v with
+    v = (X_keep' X_keep)^-1 X' a, i.e. the averaging row minus the averaged fitted forced part.
+    """
+    n_init, n_win, n_years = win.shape
+    n_points = design.shape[2]
+    design = design.astype("float64")
+    valid = np.isfinite(design).all(axis=1)                 # (year, point)
+    X = np.where(valid[:, None], design, 0.0)
+    win_lo = np.zeros((n_init, n_win, n_years, n_points), dtype="float32")
+    ref_lo = np.zeros_like(win_lo)
+    for ii, iw in np.ndindex(n_init, n_win):
+        keep = valid & ~(excluded if excluded.ndim == 1 else excluded[ii, iw])[:, None]
+        ok = keep.sum(axis=0) >= min_fit_years
+        if not ok.any():
+            continue
+        Xk = X[:, :, ok] * keep[:, None, ok]
+        inv = np.linalg.pinv(np.einsum("ytp,ysp->pts", Xk, Xk))     # (point, term, term)
+        for op, avg in ((win_lo, win[ii, iw]), (ref_lo, ref[ii, iw])):
+            v = np.einsum("pts,ysp,y->pt", inv, X[:, :, ok], avg)    # (point, term)
+            op[ii, iw][:, ok] = avg[:, None] - np.einsum("ytp,pt->yp", Xk, v)
+    return win_lo, ref_lo
+
+
+def observation_operators(cfg, scenario, target_variable, years, init_years, windows):
+    """
+    operators for the observed internal window and reference means as used in the evaluation:
+    (win_op, ref_op) of shape (init, window, year) for a design shared by all points, or for a design
+    per point (`forced: cmip6`) a dict with what `chunk_operators` needs to build them for a set of points
+    """
     ref_len = cfg["target"]["reference_length"]
     win, ref = averaging_operators(years, init_years, windows, ref_len)
-    design = SplitResults(cfg, scenario).target_design(years).values
+    design = SplitResults(cfg, scenario).target_design(target_variable, years)
     if cfg["split"]["obs_leakage"] == "full_period":
         excluded = np.zeros(len(years), dtype=bool)
     else:
         from climate_scenarios_2050.split import forced as fc
 
         excluded = fc.window_exclusions(years, init_years, windows, lag=0, reference_length=ref_len).values
-    win_lo, ref_lo = leave_out_operators(win, ref, design, excluded, cfg["split"]["min_fit_years"])
+    if design.ndim > 2:
+        design = design.transpose("year", "term", "latitude", "longitude")
+        values = design.values.reshape(len(years), design.sizes["term"], -1)
+        return {"win": win, "ref": ref, "design": values, "excluded": excluded, "min_fit_years": cfg["split"]["min_fit_years"]}
+    win_lo, ref_lo = leave_out_operators(win, ref, design.values, excluded, cfg["split"]["min_fit_years"])
     # cases without a fit have no actual scores either (masked); zeros keep NaN out of the sums
     return np.nan_to_num(win_lo), np.nan_to_num(ref_lo)
 
 
+def chunk_operators(operators, sl: slice):
+    """the operators of the points `sl`: shared (init, window, year) or per point (init, window, year, point)"""
+    if isinstance(operators, tuple):
+        return operators
+    return leave_out_operators_pointwise(operators["win"], operators["ref"], operators["design"][:, :, sl], operators["excluded"], operators["min_fit_years"])
+
+
+def chunk_inputs(operators, sl: slice):
+    """what a chunk job needs: the shared operators, or the per-point design of its points"""
+    if isinstance(operators, tuple):
+        return operators
+    return {**operators, "design": operators["design"][:, :, sl]}
+
+
 def observed_internal_target(cfg, scenario, target_variable):
-    """observed annual internal wind, forced part fitted to all years (year, latitude, longitude)"""
+    """observed annual internal target, forced part fitted to all years (year, latitude, longitude)"""
     split = SplitResults(cfg, scenario)
     wind = obs.open_obs_target(cfg, target_variable)
     coef = split.target_coef(target_variable, "coef_full").load()
-    internal = wind - (split.target_design(wind.year.values) * coef).sum("term", skipna=False)
+    internal = wind - (split.target_design(target_variable, wind.year.values) * coef).sum("term", skipna=False)
     return internal.dropna("year", how="all")
 
 
@@ -165,8 +219,13 @@ class Problem:
     target (kind, init, window, point), pred/spread (kind, method, init, window, point)
     """
 
-    def __init__(self, target, pred, spread, joint, methods, to_units, separated):
+    def __init__(self, target, pred, spread, joint, methods, to_units, separated, kinds=("full", "internal"), m0_own_errors=True):
         f = np.float32
+        self.full = kinds.index("full") if "full" in kinds else None
+        self.obs_idx = [methods.index(m) for m in OBS_METHODS if m in methods]
+        # methods whose spread is the RMS of their own errors (recomputed for every surrogate)
+        self.error_idx = self.obs_idx + ([methods.index("M0")] if m0_own_errors else [])
+        self.valid_pred = np.isfinite(pred).astype(f)
         self.target = np.nan_to_num(target).astype(f)
         self.pred = np.nan_to_num(pred).astype(f)
         self.spread = np.where(np.isfinite(spread), spread, 1.0).astype(f)
@@ -179,20 +238,33 @@ class Problem:
         self.to_units = np.nan_to_num(to_units).astype(f)   # (init, point)
         self.separated = separated.astype(f)                # (window, init, init)
 
-    def statistics(self, d_window=None, d_reference=None) -> np.ndarray:
-        """(statistic, kind, method, window, point) for a perturbation (window/reference means of d)"""
+    def statistics(self, d_window=None, d_reference=None, d_plain=None, d_obs=None) -> np.ndarray:
+        """
+        (statistic, kind, method, window, point) for a perturbation: leave-out window/reference means of d
+        (init, window, point), plain change W d - R d of the full target, d_obs (obs method, init, window, point)
+        """
         target, pred = self.target, self.pred
         if d_window is not None:
-            # (init, window, point)
+            tu = self.to_units[:, None]
             d_window, d_reference = d_window.astype(np.float32), d_reference.astype(np.float32)
-            target = target + ((d_window - d_reference) * self.to_units[:, None])[None]
-            pred = pred - self.c[None, :, None, None, None] * (d_reference * self.to_units[:, None])[None, None]
+            target = target + ((d_window - d_reference) * tu)[None]
+            if self.full is not None and d_plain is not None:
+                target[self.full] = self.target[self.full] + d_plain.astype(np.float32) * tu
+            pred = pred - self.c[None, :, None, None, None] * (d_reference * tu)[None, None]
+            for k, im in enumerate(self.obs_idx):
+                pred[:, im] = self.pred[:, im] + (d_obs[k].astype(np.float32) * tu)[None]
         # M1: spread of the observed changes around zero, non-overlapping samples
         sq = np.einsum("wij,kjwp->kiwp", self.separated, target**2 * self.valid_target)
         cnt = np.einsum("wij,kjwp->kiwp", self.separated, self.valid_target)
         with np.errstate(invalid="ignore", divide="ignore"):
             spread = self.spread.copy()
             spread[:, self.m1] = np.sqrt(sq / cnt)
+            # observations-only methods (and M0): RMS of their own errors (non-overlapping samples)
+            for im in self.error_idx:
+                v = self.valid_target * self.valid_pred[:, im]
+                sq = np.einsum("wij,kjwp->kiwp", self.separated, (target - pred[:, im]) ** 2 * v)
+                cnt = np.einsum("wij,kjwp->kiwp", self.separated, v)
+                spread[:, im] = np.sqrt(sq / cnt)
         crps = _crps(pred, spread, target[:, None])
         w = self.joint
         with np.errstate(invalid="ignore", divide="ignore"):
@@ -207,8 +279,14 @@ class Problem:
         return out
 
 
-def _chunk(problem: Problem, spectrum, phases, n_years, win_op, ref_op, area):
-    """observed statistics, exceedance counts and per-surrogate partial field sums of one chunk"""
+def _chunk(problem: Problem, spectrum, phases, n_years, operators, area, plain=None, obs_ops=None):
+    """
+    observed statistics, exceedance counts and per-surrogate partial field sums of one chunk; `plain`: the
+    full target's change operator W - R (init, window, year), `obs_ops`: those of M0c/M0t (method, init, window, year)
+    """
+    win_op, ref_op = chunk_operators(operators, slice(None))
+    pointwise = win_op.ndim == 4
+    apply = (lambda op, d: np.einsum("iwyp,yp->iwp", op, d)) if pointwise else (lambda op, d: np.einsum("iwy,yp->iwp", op, d))
     observed = problem.statistics()
     finite = np.isfinite(observed)
     exceed = np.zeros(observed.shape, dtype="int32")
@@ -218,7 +296,9 @@ def _chunk(problem: Problem, spectrum, phases, n_years, win_op, ref_op, area):
     assert np.isfinite(win_op).all() and np.isfinite(ref_op).all()
     for b in range(n):
         d = perturbation(spectrum, phases[b], n_years)
-        null = problem.statistics(np.einsum("iwy,yp->iwp", win_op, d), np.einsum("iwy,yp->iwp", ref_op, d))
+        d_plain = None if plain is None else np.einsum("iwy,yp->iwp", plain, d)
+        d_obs = None if obs_ops is None else np.einsum("miwy,yp->miwp", obs_ops, d)
+        null = problem.statistics(apply(win_op, d.astype(win_op.dtype)), apply(ref_op, d.astype(ref_op.dtype)), d_plain, d_obs)
         ok = np.isfinite(null)
         exceed += (ok & finite & (null >= observed)).astype("int32")
         n_null += ok
@@ -263,7 +343,7 @@ def surrogate_test(cfg, scenario, target_variable, targets, methods, to_units) -
     windows = [tuple(w) for w in cfg["target"]["windows"]]
     labels = [window_label(w) for w in windows]
     kinds = list(targets)
-    names = sorted({m for kind in kinds for m in methods[kind]}, key=lambda m: ["M0", "M1", "M2a", "M3a", "M2b", "M3b", "M2b_b", "M3b_b", "perfect_index"].index(m))
+    names = sorted({m for kind in kinds for m in methods[kind]}, key=METHOD_ORDER.index)
 
     template = targets[kinds[0]].transpose("init_year", "window", "latitude", "longitude")
     inits = template.init_year.values
@@ -291,7 +371,16 @@ def surrogate_test(cfg, scenario, target_variable, targets, methods, to_units) -
         __import__("warnings").simplefilter("ignore", RuntimeWarning)
         u = u - np.nanmean(u, axis=0)
     spectrum = np.fft.rfft(np.nan_to_num(u), axis=0)
-    win_op, ref_op = observation_operators(cfg, scenario, years, inits, windows)
+    operators = observation_operators(cfg, scenario, target_variable, years, inits, windows)
+    win_plain, ref_plain = averaging_operators(years, inits, windows, cfg["target"]["reference_length"])
+    plain = (win_plain - ref_plain).astype("float32")
+    obs_ops = None
+    if any(m in names for m in OBS_METHODS):
+        from climate_scenarios_2050.evaluate.target import observation_reference_operators
+
+        ocfg = cfg["evaluation"].get("obs_methods") or {}
+        ops = observation_reference_operators(years, inits, windows, cfg["target"]["reference_length"], ocfg.get("fit", "up_to_init"), ocfg.get("min_years", 20))
+        obs_ops = np.nan_to_num(ops[[OBS_METHODS.index(m) for m in OBS_METHODS if m in names]]).astype("float32")
     separated = np.stack([metrics.separated(inits, b - a + 1) for a, b in windows]).astype(float)
     phases = coherent_phases(len(years), scfg["n"], scfg["seed"])
     area = np.repeat(np.cos(np.deg2rad(space.latitude.values)), n_lon)
@@ -302,8 +391,9 @@ def surrogate_test(cfg, scenario, target_variable, targets, methods, to_units) -
     jobs = []
     for s in starts:
         sl = slice(s, s + chunk)
-        problem = Problem(target[..., sl], pred[..., sl], spread[..., sl], joint[..., sl], names, tu[:, sl], separated)
-        jobs.append(delayed(_chunk)(problem, spectrum[:, sl], phases, len(years), win_op, ref_op, area[sl]))
+        problem = Problem(target[..., sl], pred[..., sl], spread[..., sl], joint[..., sl], names, tu[:, sl], separated, kinds,
+                          cfg["evaluation"].get("m0_spread", "own_errors") == "own_errors")
+        jobs.append(delayed(_chunk)(problem, spectrum[:, sl], phases, len(years), chunk_inputs(operators, sl), area[sl], plain, obs_ops))
     results = Parallel(n_jobs=cfg["resources"]["n_jobs"], verbose=5)(jobs)
 
     observed = np.concatenate([r[0] for r in results], axis=-1)

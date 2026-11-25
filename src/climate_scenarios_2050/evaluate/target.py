@@ -3,24 +3,34 @@ Step 5b: verification of the target methods (`<root>/evaluate_target/<hash>/`), 
 
 Change of the target-window mean against the observed reference (years Y-19 ... Y), relative [%] or
 absolute as the target's `change`. All predictions are Gaussian (mean, spread):
-  M0    reversion to the long-term mean, no index information: change = -observed internal reference
+  M0    reversion to the long-term mean, no index information: change = -observed internal reference;
+        spread: RMS of its own errors over the non-overlapping samples (as M1, M0c, M0t; its error is the
+        observed internal window mean)
   perfect_index  the linear model given the observed index in the target window (upper limit, not a forecast)
   M1    persistence: no change, spread of the observed changes (non-overlapping samples)
+  M0c/M0t  observations only (`evaluation.obs_methods`, full target only): M0 with the forced part estimated
+           from the observed target alone, a constant (M0c: return to the observed mean) or a linear trend
+           (M0t), fitted on the years up to init (`fit: up_to_init`) or on all years except the target window
+           and reference (`leave_out`, as M0); change = fit(target window) - R[obs]; spread: RMS of their
+           own errors (non-overlapping samples, as M1)
   M2a/M3a  change of the target's CMIP6 variable (e.g. sfcWind for wsp100) in all/analogue members
   M2b/M3b  linear model on the index (indices) of all/analogue members:
            internal change = sum_p slope_p x_p + intercept - observed internal reference,
            spread^2 = slope' C slope + sigma^2, x = predictor window means of the members, C their covariance
 Targets:
-  full      observed change. M2b/M3b add the forced part: `a` (regression on the index MMEM, the
-            default) and, with a CMIP6 variable, `b` (change of its CMIP6 MMEM; suffix _b)
+  full      observed change. M2b/M3b add the forced part: `a` (the forced part of the target's split: regression
+            on the index MMEM with `targets.<name>.forced: index`, the scaled MMEM of the target's CMIP6 variable
+            with `forced: cmip6`; the default) and, with a CMIP6 variable, `b` (change of its CMIP6 MMEM; suffix _b)
   internal  observed internal change (forced signal removed without target and reference period).
-            M2a/M3a: minus the change of the CMIP6 MMEM
+            M3a: minus the change of the CMIP6 MMEM (M2a is left out: its mean is the MMEM change, so it
+            would predict zero up to rounding)
 M2a/M3a and `b` need a CMIP6 variable (not available for energy). The CMIP6 changes are taken as they
 are: with `change: absolute` they are in CMIP6 units (e.g. K for tas, m/s of the 10 m wind for wsp100).
 
 Outputs: `scores.nc` (fc_method, target, window, latitude, longitude), `sites.nc` with
 block-bootstrap intervals of the correlation at the sites of `region.sites`, and
-`significance.nc`: local and field significance of the skill beyond M0 (see `surrogates.py`).
+`significance.nc`: local and field significance of the skill beyond M0 (see `surrogates.py`),
+`significance_m1.nc`: whether a method beats M1 (paired block bootstrap, `versus_m1.py`).
 """
 
 import logging
@@ -60,16 +70,89 @@ def to_target_grid(da: xr.DataArray, like: xr.DataArray) -> xr.DataArray:
 
 
 def index_forced_change(split, target_variable, years, init_years, windows, reference_length) -> xr.DataArray:
-    """change of the forced part (a) in units of the target, per (init_year, window, space)"""
-    coef = split.target_coef(target_variable, "coef_window").load()
-    design = split.target_design(years)
-    delta = np.full((len(init_years), len(windows), design.sizes["term"]), np.nan)
+    """
+    change of the forced part (a) of the target's split in units of the target, per (init_year, window, space):
+    the regression on the index MMEM (`forced: index`) or the scaled MMEM of the target's CMIP6 variable (`cmip6`)
+    """
+    coef = split.target_coef(target_variable, "coef_window").load().sel(init_year=init_years)
+    labels = [window_label(w) for w in windows]
+    coef = coef.sel(window=labels)
+    design = split.target_design(target_variable, years)
+    space = [d for d in coef.dims if d not in ("init_year", "window", "term")]
+    if design.ndim > 2:
+        design = design.transpose("year", "term", *space)
+    D = design.values.reshape(design.sizes["year"], design.sizes["term"], -1)   # (year, term, points or 1)
+    C = coef.transpose("init_year", "window", "term", *space).values
+    C = C.reshape(*C.shape[:3], -1)
+    design_years = design.year.values
+    out = np.full((len(init_years), len(windows), C.shape[-1]), np.nan)
     for ii, init in enumerate(init_years):
-        ref = design.sel(year=slice(int(init) - reference_length + 1, int(init))).mean("year")
+        in_ref = (design_years > int(init) - reference_length) & (design_years <= int(init))
+        ref = D[in_ref].mean(axis=0)
         for iw, (a, b) in enumerate(windows):
-            delta[ii, iw] = (design.sel(year=slice(int(init) + a, int(init) + b)).mean("year") - ref).values
-    delta = xr.DataArray(delta, dims=("init_year", "window", "term"), coords={"init_year": init_years, "window": [window_label(w) for w in windows], "term": design["term"]})
-    return (delta * coef.sel(init_year=init_years)).sum("term", skipna=False)
+            in_win = (design_years >= int(init) + a) & (design_years <= int(init) + b)
+            if in_win.sum() < b - a + 1 or in_ref.sum() < reference_length:
+                continue
+            delta = D[in_win].mean(axis=0) - ref                                    # (term, points or 1)
+            out[ii, iw] = (delta * C[ii, iw]).sum(axis=0)
+    shape = [coef.sizes[d] for d in space]
+    coords = {"init_year": init_years, "window": labels, **{d: coef[d] for d in space}}
+    return xr.DataArray(out.reshape(len(init_years), len(windows), *shape), dims=("init_year", "window", *space), coords=coords)
+
+
+OBS_METHODS = ("M0c", "M0t")
+
+
+def observation_reference_operators(years, init_years, windows, reference_length, fit="up_to_init", min_years=20):
+    """
+    operators (method, init, window, year) of the observations-only methods: prediction = op @ obs, the fit of a
+    constant (M0c) or a linear trend (M0t) evaluated over the target window minus the reference mean R[obs].
+    Fit years: up to init, or all years except the target window and reference (`leave_out`). NaN where
+    fewer than `min_years` years are available.
+    """
+    years = np.asarray(years, dtype=float)
+    ops = np.full((len(OBS_METHODS), len(init_years), len(windows), len(years)), np.nan)
+    for ii, init in enumerate(init_years):
+        in_ref = (years > init - reference_length) & (years <= init)
+        if in_ref.sum() < reference_length:
+            continue
+        ref = in_ref / in_ref.sum()
+        for iw, (a, b) in enumerate(windows):
+            in_win = (years >= init + a) & (years <= init + b)
+            keep = years <= init if fit == "up_to_init" else ~(in_win | in_ref)
+            if keep.sum() < min_years:
+                continue
+            t0 = (init + a + init + b) / 2 - years[keep].mean()
+            t = years - years[keep].mean()
+            const = keep / keep.sum()
+            slope = keep * t / (keep * t**2).sum()
+            ops[0, ii, iw] = const - ref
+            ops[1, ii, iw] = const + t0 * slope - ref
+    return ops
+
+
+def observation_reference(wind: xr.DataArray, init_years, windows, reference_length, fit, min_years) -> dict:
+    """predicted full change (target units) of M0c/M0t, {method: (init_year, window, latitude, longitude)}"""
+    years = wind.year.values
+    ops = observation_reference_operators(years, init_years, windows, reference_length, fit, min_years)
+    values = wind.transpose("year", ...).values.reshape(len(years), -1)
+    missing = np.isnan(values).astype(float)
+    filled = np.nan_to_num(values)
+    out = {}
+    for im, name in enumerate(OBS_METHODS):
+        op = ops[im]
+        pred = np.einsum("iwy,yp->iwp", np.nan_to_num(op), filled)
+        used = np.einsum("iwy,yp->iwp", (np.nan_to_num(op) != 0).astype(float), missing)
+        pred = np.where(np.isnan(op).any(axis=-1)[..., None] | (used > 0), np.nan, pred)
+        da = xr.DataArray(pred.reshape(len(init_years), len(windows), *wind.shape[1:]), dims=("init_year", "window", *wind.dims[1:]),
+                          coords={"init_year": init_years, "window": [window_label(w) for w in windows], **{d: wind[d] for d in wind.dims[1:]}})
+        out[name] = da
+    return out
+
+
+def error_spread(target: xr.DataArray, pred, windows) -> xr.DataArray:
+    """leave-out RMS of the errors target - pred over the non-overlapping samples (pred 0: persistence)"""
+    return persistence_spread(target - pred, windows)
 
 
 def persistence_spread(target: xr.DataArray, windows) -> xr.DataArray:
@@ -134,6 +217,7 @@ def build_predictions(cfg, scenario, target_variable):
     # (the internal part has zero mean over the fitting years), and the observed index in the target window
     reversion = -params["obs_reference"] * to_units
     perfect = ((slope * params["index_window"]).sum("predictor", skipna=False) + params["intercept"] - params["obs_reference"]) * to_units
+    # M0 spread: placeholder, replaced by the RMS of its own errors once the targets are final (below)
     methods["internal"]["M0"] = (reversion, params["sigma"] * to_units)
     methods["full"]["M0"] = (reversion + forced_a, params["sigma"] * to_units)
     methods["internal"]["perfect_index"] = (perfect, params["sigma"] * to_units)
@@ -148,7 +232,9 @@ def build_predictions(cfg, scenario, target_variable):
             mean = to_target_grid(sfc["mean"].sel(ensemble=ensemble, drop=True), wind)
             spread = to_target_grid(sfc["std"].sel(ensemble=ensemble, drop=True), wind)
             methods["full"][name] = (mean, spread)
-            methods["internal"][name] = (mean - mmem, spread)
+            if name != "M2a":
+                # M2a on the internal target would be its mean minus the MMEM: zero up to rounding (same weighting)
+                methods["internal"][name] = (mean - mmem, spread)
         for name in ["M2b", "M3b"]:
             internal, spread = methods["internal"][name]
             methods["full"][f"{name}_b"] = (internal + mmem, spread)
@@ -159,6 +245,17 @@ def build_predictions(cfg, scenario, target_variable):
         targets[kind] = target
         spread = persistence_spread(target, windows)
         methods[kind]["M1"] = (xr.zeros_like(target), spread)
+        if cfg["evaluation"].get("m0_spread", "own_errors") == "own_errors":
+            mean = methods[kind]["M0"][0].transpose(*target.dims)
+            methods[kind]["M0"] = (mean, error_spread(target, mean, windows))
+    # observations only (full target): M0 with a constant or a linear trend as forced part
+    ocfg = cfg["evaluation"].get("obs_methods") or {}
+    if ocfg.get("enabled"):
+        preds = observation_reference(wind, inits, windows, ref_len, ocfg.get("fit", "up_to_init"), ocfg.get("min_years", 20))
+        target = targets["full"]
+        for name, pred in preds.items():
+            pred = (pred * to_units).transpose(*target.dims).where(target.notnull())
+            methods["full"][name] = (pred, error_spread(target, pred, windows))
     return targets, methods, to_units
 
 
@@ -181,6 +278,8 @@ def site_table(cfg, targets, methods, windows) -> xr.Dataset:
                     m = mean.sel(window=label).sel(latitude=loc["lat"], longitude=loc["lon"], method="nearest").transpose("init_year").values
                     if name != "M1":
                         jobs.append(delayed(_site_row)(cfg, site, label, b - a + 1, kind, name, m, t))
+    if not jobs:   # no sites configured (region.sites: {})
+        return xr.Dataset()
     rows = Parallel(n_jobs=cfg["resources"]["n_jobs"])(jobs)
     return xr.Dataset.from_dataframe(pd.DataFrame(rows).set_index(["target", "fc_method", "window", "site"]))
 
@@ -205,6 +304,10 @@ def run_case(cfg, scenario, target_variable):
         from climate_scenarios_2050.evaluate.surrogates import surrogate_test
 
         write_netcdf(surrogate_test(cfg, scenario, target_variable, targets, methods, to_units), out.path("significance.nc"), cfg, compress=True)
+    if cfg["evaluation"].get("significance", {}).get("versus_m1") and not out.exists("significance_m1.nc"):
+        from climate_scenarios_2050.evaluate.versus_m1 import m1_test
+
+        write_netcdf(m1_test(cfg, targets, methods, windows), out.path("significance_m1.nc"), cfg, compress=True)
     from climate_scenarios_2050.plotting.target import plot_target_evaluation
     plot_target_evaluation(cfg, out, scenario, target_variable)
     return out

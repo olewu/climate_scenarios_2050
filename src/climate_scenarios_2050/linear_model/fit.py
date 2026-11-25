@@ -33,15 +33,19 @@ from climate_scenarios_2050.core.timeconv import window_label
 from climate_scenarios_2050.preprocess import obs
 from climate_scenarios_2050.preprocess.indices.compute import open_obs_index
 from climate_scenarios_2050.split import forced as fc
-from climate_scenarios_2050.split.run import SplitResults, available_target_variables, predictor_split_hashes
+from climate_scenarios_2050.split.run import SplitResults, available_target_variables, predictor_split_hashes, target_forced_id
 
 log = logging.getLogger(__name__)
 
 
 def linear_model_output(cfg, scenario: str, target_variable: str) -> StepOutput:
+    extra = {"scenario": scenario, "target_variable": target_variable, "training_index": cfg["obs"]["training_index"]}
+    forced = target_forced_id(cfg, scenario, target_variable)
+    if forced:   # only when not the default (`index`), so existing hashes stay valid
+        extra["target_forced"] = forced
     return StepOutput(
         cfg, "linear_model", sections=["linear_model", "target"],
-        extra={"scenario": scenario, "target_variable": target_variable, "training_index": cfg["obs"]["training_index"]},
+        extra=extra,
         upstream={"split": predictor_split_hashes(cfg, scenario), "obs_target": obs.target_output(cfg, target_variable).hash},
     )
 
@@ -121,7 +125,10 @@ class Training:
         self.wind_values = self.wind_raw.values.reshape(len(years), -1)
         self.index_raw = {name: index.sel(year=years - self.lag) for name, index in indices.items()}
         self.index_design = {name: fc.design_matrix(self.splits[name].basis, self.index_raw[name].year.values).values for name in self.predictors}
-        self.wind_design = self.split.target_design(years).values
+        design = self.split.target_design(target_variable, years)
+        if design.ndim > 2:   # forced: cmip6, a regressor per grid point
+            design = design.transpose("year", "term", *self.space_dims)
+        self.wind_design = design.values.reshape(len(years), design.sizes["term"], -1) if design.ndim > 2 else design.values
 
     def index_cases(self, case: str) -> dict:
         """leave-out coefficients of every predictor index for a case (e.g. coef_window_lag1)"""
@@ -130,7 +137,7 @@ class Training:
     def internal(self, index_coefs: dict, wind_coef: np.ndarray):
         """internal indices (years, predictor) and target (years, points) for the coefficients of one case"""
         index_internal = np.stack([self.index_raw[n].values - self.index_design[n] @ index_coefs[n] for n in self.predictors], axis=1)
-        wind_internal = self.wind_values - self.wind_design @ wind_coef.reshape(wind_coef.shape[0], -1)
+        wind_internal = self.wind_values - fc.forced_values(self.wind_design, wind_coef.reshape(wind_coef.shape[0], -1))
         return index_internal, wind_internal
 
     def unstack(self, values: np.ndarray, extra_shape=()) -> np.ndarray:

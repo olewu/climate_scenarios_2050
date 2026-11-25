@@ -8,14 +8,20 @@ Methods, per scenario, as (mean, spread) of the change of each target window aga
 reference (the `reference_length` years up to init), relative [%] or absolute as the target's `change`.
 If the target record ends before the init year (the index can be more recent than the target data), the reference is the last `reference_length` years of the
 record instead (`reference_end`, also selectable explicitly), and all methods use these same years:
-  M0   return to the long-term mean (no index information): internal reference removed, forced part added
+  M0   return to the long-term mean (no index information): internal reference removed, forced part added;
+       spread: RMS of its errors at earlier, complete windows (= their internal window means), as M0c/M0t
   M1   persistence: no change, spread of the past observed changes
+  M0c  observations only (`evaluation.obs_methods`): return to the mean of the observed target up to the reference end
+  M0t  observations only: linear trend fitted to the observed target up to the reference end, read at the target
+       window, minus the reference mean; M0c/M0t spreads: RMS of their errors at earlier, complete windows (same
+       gap between reference end and init), each predicted from the years before it
   M2a  the target's CMIP6 variable in all members (e.g. sfcWind for wsp100; where it exists)
   M2b  linear model on the index of all members
   M3a  the target's CMIP6 variable in the analogue members
   M3b  linear model on the index of the analogue members
-The components of the linear-model methods are stored as well: `internal`, `forced_index` and `forced_cmip6`
-(the latter where the CMIP6 variable exists). `forced_target` selects which forced part enters M0, M2b and M3b.
+The components of the linear-model methods are stored as well: `internal`, `forced_index` (the forced part of
+the target's split: index MMEM regression, or the scaled MMEM of its CMIP6 variable with `targets.<name>.forced:
+cmip6`) and `forced_cmip6` (the plain CMIP6 MMEM change, where the CMIP6 variable exists). `forced_target` selects which forced part enters M0, M2b and M3b.
 
 If a window lies inside the record, the observed change is added (`observed`).
 
@@ -51,9 +57,17 @@ from climate_scenarios_2050.split.run import SplitResults, split_output
 
 log = logging.getLogger(__name__)
 
+METHODS = ["M0", "M1", "M0c", "M0t", "M2a", "M2b", "M3a", "M3b"]
+
 
 def forecast_output(cfg, scenarios, target_variable, windows) -> StepOutput:
     spec = target_spec(cfg, target_variable)
+    extra_methods = {}
+    ocfg = cfg["evaluation"].get("obs_methods") or {}
+    if ocfg.get("enabled"):   # only recorded when used, so other settings keep their hashes
+        extra_methods = {"obs_methods": {"min_years": ocfg.get("min_years", 20)}}
+    if cfg["evaluation"].get("m0_spread", "own_errors") == "own_errors":
+        extra_methods["m0_spread"] = "own_errors"
     upstream = {"indices": index_output(cfg).hash, "split": {s: split_output(cfg, s).hash for s in scenarios}, "obs_target": obs.target_output(cfg, target_variable).hash}
     names = hindcast_indices(cfg)
     if names != [primary_index(cfg)]:
@@ -63,15 +77,15 @@ def forecast_output(cfg, scenarios, target_variable, windows) -> StepOutput:
         upstream["cmip6_fields"] = {s: cmip6.field_id(cfg, spec["cmip6"], CMIP6_AGGREGATION, s) for s in scenarios}
     return StepOutput(
         cfg, "forecast", sections=["analogues", "linear_model", "forced_target", "split"],
-        extra={"scenarios": list(scenarios), "target_variable": target_variable, "spec": spec, "windows": [list(w) for w in windows], "target": select(cfg, ["target"])["target"] | {"windows": None}, "matching_index": cfg["obs"]["matching_index"], "training_index": cfg["obs"]["training_index"]},
+        extra={"scenarios": list(scenarios), "target_variable": target_variable, "spec": spec, "windows": [list(w) for w in windows], "target": select(cfg, ["target"])["target"] | {"windows": None}, "matching_index": cfg["obs"]["matching_index"], "training_index": cfg["obs"]["training_index"], **extra_methods},
         upstream=upstream,
     )
 
 
-def internal_up_to_init(series: xr.DataArray, basis: xr.DataArray, init: int, min_fit_years: int, lag: int = 0) -> xr.DataArray:
-    """series minus its forced part, with coefficients fitted on the years up to init"""
+def internal_up_to_init(series: xr.DataArray, basis: xr.DataArray, init: int, min_fit_years: int, lag: int = 0, design: xr.DataArray = None) -> xr.DataArray:
+    """series minus its forced part, with coefficients fitted on the years up to init (`design`: instead of the basis)"""
     years = series.year.values
-    design = fc.design_matrix(basis, years, lag=lag)
+    design = fc.design_matrix(basis, years, lag=lag) if design is None else design
     coef = fc.fit_coefficients(series, design, fc.up_to_init_exclusions(years, [init]).isel(init_year=0, drop=True), min_fit_years)
     return series - fc.forced_part(design, coef), coef
 
@@ -119,19 +133,71 @@ def quadratic(slope: xr.DataArray, cov: xr.DataArray) -> xr.DataArray:
     return (slope * (cov * slope.rename(predictor="predictor2")).sum("predictor2")).sum("predictor")
 
 
-def past_change_spread(wind: xr.DataArray, window, reference_length: int, init: int, gap: int = 0) -> xr.DataArray:
+def past_change_spread(wind: xr.DataArray, window, reference_length: int, init: int, gap: int = 0, reference: bool = True) -> xr.DataArray:
     """
     root mean square of the observed changes [units of the target] of earlier, complete windows, with the same
-    distance (`gap` years) between the end of the reference and the init year
+    distance (`gap` years) between the end of the reference and the init year; `reference=False`: of the window
+    means themselves (e.g. of the internal series: the errors of M0)
     """
     a, b = window
     changes = []
     for past in range(int(wind.year.min()) + reference_length - 1 + gap, init - b + 1):
         end = past - gap
-        changes.append(wind.sel(year=slice(past + a, past + b)).mean("year") - wind.sel(year=slice(end - reference_length + 1, end)).mean("year"))
+        win = wind.sel(year=slice(past + a, past + b))
+        if win.sizes["year"] < b - a + 1 or not bool(win.notnull().any()):
+            continue
+        ref = wind.sel(year=slice(end - reference_length + 1, end)).mean("year") if reference else 0
+        changes.append(win.mean("year") - ref)
     if len(changes) < 5:
         return xr.full_like(wind.isel(year=0, drop=True), np.nan)
     return np.sqrt((xr.concat(changes, dim="sample") ** 2).mean("sample"))
+
+
+def obs_reference_forecast(wind: xr.DataArray, window, reference_length: int, reference_end: int, init: int, min_years: int):
+    """
+    M0c/M0t (observations only) for one window, in units of the target: {name: (change, spread)} over space.
+    Fit on the years up to `reference_end`; spread: RMS of the same predictions for earlier, complete windows
+    (reference ending `init - reference_end` years before their own init), each fitted on the years before it.
+    """
+    a, b = window
+    years = wind.year.values
+    values = wind.transpose("year", ...).values.reshape(len(years), -1)
+    space = wind.isel(year=0, drop=True)
+
+    def predict(end, start):
+        """(M0c, M0t) change predictions for a reference ending in `end` and a window starting `start` years after it"""
+        keep = years <= end
+        if keep.sum() < min_years:
+            return None
+        y = values[keep]
+        t = years[keep] - years[keep].mean()
+        const = y.mean(axis=0)
+        slope = (t[:, None] * (y - const)).sum(axis=0) / (t**2).sum()
+        ref = values[(years > end - reference_length) & (years <= end)].mean(axis=0)
+        t_win = (end + start + end + start + (b - a)) / 2 - years[keep].mean()
+        return const - ref, const + slope * t_win - ref
+
+    gap = init - reference_end
+    current = predict(reference_end, gap + a)
+    if current is None:
+        return {}
+    errors = []
+    for past in range(int(years.min()) + reference_length - 1 + gap, init - b + 1):
+        end = past - gap
+        pred = predict(end, gap + a)
+        if pred is None:
+            continue
+        in_win = (years >= past + a) & (years <= past + b)
+        if in_win.sum() < b - a + 1:
+            continue
+        change = values[in_win].mean(axis=0) - values[(years > end - reference_length) & (years <= end)].mean(axis=0)
+        errors.append([change - pred[0], change - pred[1]])
+    out = {}
+    for k, name in enumerate(("M0c", "M0t")):
+        spread = np.sqrt(np.mean([e[k] ** 2 for e in errors], axis=0)) if len(errors) >= 5 else np.full(values.shape[1], np.nan)
+        wrap = lambda v: xr.DataArray(v.reshape(space.shape), dims=space.dims, coords=space.coords)
+        out[name] = (wrap(current[k]), wrap(spread))
+    return out
 
 
 def forecast_scenario(cfg, scenario, target_variable, init, windows, reference_end=None) -> xr.Dataset:
@@ -168,7 +234,7 @@ def forecast_scenario(cfg, scenario, target_variable, init, windows, reference_e
 
     # training data: internal indices and target up to init
     training = Training(cfg, scenario, target_variable)
-    wind_internal, wind_coef = internal_up_to_init(wind, split.basis, init, min_fit, lag=lag)
+    wind_internal, wind_coef = internal_up_to_init(wind, split.basis, init, min_fit, lag=lag, design=split.target_design(target_variable, wind.year.values))
     pair = training.years[training.years <= reference_end]
     x_train = np.stack([
         internal_up_to_init(open_obs_index(cfg, training.index_name, n).dropna("year"), splits[n].basis, init, min_fit)[0].sel(year=pair - lag).values
@@ -178,7 +244,7 @@ def forecast_scenario(cfg, scenario, target_variable, init, windows, reference_e
     internal_ref = wind_internal.isel(year=in_ref.values).mean("year")
 
     future = np.arange(reference_end - ref_len + 1, init + max(w[1] for w in windows) + 1)
-    design = fc.design_matrix(split.basis, future, lag=lag)
+    design = split.target_design(target_variable, future)
     forced_ref = fc.forced_part(design.sel(year=slice(reference_end - ref_len + 1, reference_end)), wind_coef).mean("year")
 
     # the target's CMIP6 variable (M2a/M3a, forced part b)
@@ -219,14 +285,23 @@ def forecast_scenario(cfg, scenario, target_variable, init, windows, reference_e
             forced = forced_index
 
         internal_m0 = -internal_ref * to_units
-        # M0 has no predictor: spread of the predicted training window means around their mean
-        x_windows = sliding_means(x_train, length)
-        x_windows = x_windows[np.isfinite(x_windows).all(axis=1)]
-        explained_var = xr.DataArray(np.cov(x_windows.T, bias=True).reshape(len(predictors), len(predictors)), dims=("predictor", "predictor2"))
-        spread_m0 = np.sqrt(sigma**2 + quadratic(slope, explained_var)) * to_units
+        if cfg["evaluation"].get("m0_spread", "own_errors") == "own_errors":
+            # RMS of M0's errors at earlier, complete windows: its error is the internal window mean (the prediction is
+            # internal = 0, the forced part cancels on the full target)
+            spread_m0 = past_change_spread(wind_internal, window, ref_len, init, gap, reference=False) * to_units
+        else:
+            # from the linear model: spread of the predicted training window means around their mean plus the residual
+            x_windows = sliding_means(x_train, length)
+            x_windows = x_windows[np.isfinite(x_windows).all(axis=1)]
+            explained_var = xr.DataArray(np.cov(x_windows.T, bias=True).reshape(len(predictors), len(predictors)), dims=("predictor", "predictor2"))
+            spread_m0 = np.sqrt(sigma**2 + quadratic(slope, explained_var)) * to_units
         methods = {"M0": (internal_m0, spread_m0, internal_m0)}
         spread_m1 = past_change_spread(wind, window, ref_len, init, gap) * to_units
         methods["M1"] = (xr.zeros_like(wind_ref), spread_m1, None)
+        ocfg = cfg["evaluation"].get("obs_methods") or {}
+        if ocfg.get("enabled"):
+            for name, (change, spread) in obs_reference_forecast(wind, window, ref_len, reference_end, init, ocfg.get("min_years", 20)).items():
+                methods[name] = (change * to_units, spread * to_units, None)
         for name, x_mean, x_cov in [("M2b", all_mean, all_cov), ("M3b", ana_mean, ana_cov)]:
             x_mean = xr.DataArray(x_mean, dims="predictor", coords={"predictor": predictors})
             x_cov = xr.DataArray(x_cov, dims=("predictor", "predictor2"))
@@ -247,8 +322,7 @@ def forecast_scenario(cfg, scenario, target_variable, init, windows, reference_e
                 on_wind = lambda v: to_target_grid(xr.DataArray(v, dims=("lat", "lon"), coords=grid), wind_ref)
                 methods[name] = (on_wind(m), on_wind(s), None)
 
-        names = ["M0", "M1", "M2a", "M2b", "M3a", "M3b"]
-        names = [n for n in names if n in methods]
+        names = [n for n in METHODS if n in methods]
         full = {}
         for name in names:
             mean, spread, part = methods[name]
@@ -379,7 +453,7 @@ def run(cfg, init: int, scenarios=None, target_variable=None, windows=None, site
         reference = parts[0]["reference_value"]
         attrs = parts[0].attrs
         # scenarios without the CMIP6 variable lack M2a/M3a and the CMIP6 forced part: NaN there
-        names = [m for m in ["M0", "M1", "M2a", "M2b", "M3a", "M3b"] if any(m in p.fc_method.values for p in parts)]
+        names = [m for m in METHODS if any(m in p.fc_method.values for p in parts)]
         parts = [p.drop_vars("reference_value").reindex(fc_method=names) for p in parts]
         for ii, part in enumerate(parts):
             if "forced_cmip6" not in part and any("forced_cmip6" in q for q in parts):

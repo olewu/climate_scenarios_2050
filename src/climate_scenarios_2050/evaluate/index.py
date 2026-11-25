@@ -8,6 +8,11 @@ AR(1) and sine + trend baselines:
   correlation and RMSE skill over all inits per lead time, with block bootstrap intervals and
   phase-randomization p-values. Observations are smoothed with the same *centred* running mean (the old
   trailing mean was 4 years off). Verified against the index split with the full-period coefficients.
+- `continuous_crps`: the CRPS of the same smoothed member hindcasts per lead time (products with members), and
+  the CRPSS against the full CMIP6 ensemble, 1 - sum_Y CRPS(product) / sum_Y CRPS(cmip6_all) over the inits
+  both cover, with a 95 % paired moving-block bootstrap interval and the one-sided p-value of "no improvement"
+  (blocks of max(n^(1/3), running mean) inits, as in `versus_m1.py`). Separate file, so that older folders
+  get it on a rerun without recomputing anything else.
 - `windows`: change of the target-window mean relative to the 20 seasons before init. Verified against
   the index split with the target window and reference left out, forecasts use their own reference
   (observed for the baselines). Deterministic and probabilistic scores.
@@ -42,7 +47,7 @@ def evaluation_output(cfg, scenario, index: str = None) -> StepOutput:
     # several indices in the hindcast: one evaluation per index
     extra = {"index": index} if hindcast_indices(cfg) != [primary_index(cfg)] else {}
     # the significance test of the target evaluation is not used here
-    return StepOutput(cfg, "evaluate_index", sections=["evaluation", "baselines"], extra=extra, upstream={"hindcast_index": hindcast_output(cfg, scenario).hash}, exclude={"evaluation": ["significance"]})
+    return StepOutput(cfg, "evaluate_index", sections=["evaluation", "baselines"], extra=extra, upstream={"hindcast_index": hindcast_output(cfg, scenario).hash}, exclude={"evaluation": ["significance", "obs_methods", "m0_spread"]})
 
 
 def lead_window_change(hc: xr.DataArray, windows, reference_length: int) -> xr.DataArray:
@@ -123,6 +128,55 @@ def continuous_evaluation(cfg, products, verification, leads_eval) -> xr.Dataset
     names = list(products)
     data = {k: (("product", "lead"), np.array([[next(r[k] for r in rows if r["product"] == n and r["lead"] == int(l)) for l in leads_eval] for n in names], dtype=float)) for k in keys}
     return xr.Dataset(data, coords={"product": names, "lead": leads_eval})
+
+
+def _crps_per_init(product: xr.DataArray, verification: xr.DataArray, lead: int) -> np.ndarray:
+    """CRPS (init_year,) of the members at one lead against the verification; NaN where either is missing"""
+    fc = product.sel(lead=lead).transpose("init_year", "member").values
+    obs = verification.sel(init_year=product.init_year, lead=lead).values
+    ok = np.isfinite(obs) & np.isfinite(fc).any(axis=1)
+    out = np.full(len(obs), np.nan)
+    if ok.any():
+        out[ok] = metrics._crps_ensemble(fc[ok], obs[ok])
+    return out
+
+
+def continuous_crps(cfg, products, verification, leads_eval, reference="cmip6_all") -> xr.Dataset:
+    """CRPS per product and lead (smoothed members) and the CRPSS against `reference` with bootstrap interval and p"""
+    from climate_scenarios_2050.evaluate.versus_m1 import block_counts
+
+    Nyr = cfg["evaluation"]["index_continuous"]["running_mean"]
+    boot = cfg["evaluation"]["bootstrap"]
+    names = [n for n, p in products.items() if p.sizes["member"] > 1]
+    smoothed = {n: products[n] if cfg["baselines"]["ar1"].get(n, {}).get("fit_on") == "running_mean" else products[n].rolling(lead=Nyr, center=True).mean() for n in names}
+    shape = (len(names), len(leads_eval))
+    crps, skill, lo, hi, pval = (np.full(shape, np.nan) for _ in range(5))
+    rng = np.random.default_rng(boot["seed"])
+    for k, lead in enumerate(leads_eval):
+        per_init = {n: _crps_per_init(smoothed[n], verification, int(lead)) for n in names}
+        ref = per_init.get(reference)
+        for i, n in enumerate(names):
+            crps[i, k] = np.nanmean(per_init[n]) if np.isfinite(per_init[n]).any() else np.nan
+            if ref is None or n == reference:
+                continue
+            ok = np.isfinite(per_init[n]) & np.isfinite(ref)
+            a, b = per_init[n][ok], ref[ok]
+            if len(a) < 3 or b.sum() <= 0:
+                continue
+            skill[i, k] = 1 - a.sum() / b.sum()
+            counts = block_counts(len(a), max(int(round(len(a) ** (1 / 3))), Nyr), boot["n"], rng)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                dist = 1 - (counts @ a) / (counts @ b)
+            dist = dist[np.isfinite(dist)]
+            lo[i, k], hi[i, k] = np.percentile(dist, [2.5, 97.5])
+            pval[i, k] = (1 + ((dist - skill[i, k]) >= skill[i, k]).sum()) / (len(dist) + 1)
+    dims = ("product", "lead")
+    ds = xr.Dataset({"crps": (dims, crps), f"crpss_{reference.split('_')[0]}": (dims, skill), f"crpss_{reference.split('_')[0]}_ci_low": (dims, lo),
+                     f"crpss_{reference.split('_')[0]}_ci_high": (dims, hi), f"crpss_{reference.split('_')[0]}_p": (dims, pval)},
+                    coords={"product": names, "lead": leads_eval})
+    ds.attrs.update({"reference": reference, "running_mean": Nyr, "n_bootstrap": boot["n"],
+                     "definition": "CRPS of the centred running means of the members; CRPSS = 1 - sum CRPS / sum CRPS(reference) over the common inits"})
+    return ds
 
 
 def obs_running_verification(internal_full, inits, leads, Nyr) -> xr.DataArray:
@@ -229,6 +283,8 @@ def run_scenario(cfg, scenario, index: str = None):
     verification = obs_running_verification(internal_full, inits, leads, ncfg["running_mean"])
     if not out.exists("continuous.nc"):
         write_netcdf(continuous_evaluation(cfg, products, verification, leads_eval), out.path("continuous.nc"), cfg)
+    if not out.exists("continuous_crps.nc"):
+        write_netcdf(continuous_crps(cfg, products, verification, leads_eval), out.path("continuous_crps.nc"), cfg)
     if not out.exists("hindcast_overview.nc"):
         write_netcdf(hindcast_overview(cfg, products, internal_full, name), out.path("hindcast_overview.nc"), cfg)
 

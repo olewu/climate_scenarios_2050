@@ -49,6 +49,7 @@ def load_config(override_files=(), paths_file=None, default_file=None) -> dict:
     cfg["paths"] = load_yaml(paths_file or CONFIG_DIR / "paths.yaml")
     cfg = resolve_matching_window(cfg)
     cfg = resolve_region(cfg)
+    cfg = resolve_jet_mask(cfg)
     validate(cfg)
     return cfg
 
@@ -58,6 +59,18 @@ def resolve_region(cfg: dict) -> dict:
     for fcfg in cfg.get("preprocess", {}).get("fields", {}).values():
         if fcfg.get("domain") == "region":
             fcfg["domain"] = copy.deepcopy(cfg["region"]["domain"])
+    return cfg
+
+
+def resolve_jet_mask(cfg: dict) -> dict:
+    """`predictor.jet.mask` (a file in configs/masks): its checksum is added, so a changed mask changes the hashes"""
+    pred = cfg.get("predictor") or {}
+    for opts in [pred.get("jet"), *[(i or {}).get("jet") for i in (pred.get("indices") or {}).values()]]:
+        if opts and opts.get("mask"):
+            fl = CONFIG_DIR / "masks" / f"{opts['mask']}.nc"
+            if not fl.exists():
+                raise ValueError(f"predictor.jet.mask: no file {fl}")
+            opts["mask_checksum"] = hashlib.sha256(fl.read_bytes()).hexdigest()[:16]
     return cfg
 
 
@@ -77,6 +90,10 @@ def validate(cfg: dict):
         spec = targets[name]
         if spec["change"] not in ("relative", "absolute"):
             raise ValueError(f"targets.{name}.change must be relative or absolute")
+        if spec.get("forced", "index") not in ("index", "cmip6"):
+            raise ValueError(f"targets.{name}.forced must be index or cmip6")
+        if spec.get("forced") == "cmip6" and not spec.get("cmip6"):
+            raise ValueError(f"targets.{name}.forced: cmip6 needs a CMIP6 variable (targets.{name}.cmip6)")
         if spec["source"] == "file":
             if spec["file"] not in cfg["paths"]["inputs"].get("targets", {}):
                 raise ValueError(f"targets.{name}: no path for {spec['file']} in paths.inputs.targets")
@@ -110,6 +127,17 @@ def _validate_predictor(cfg: dict, sources: dict, fields: dict):
         point = pred.get("sign_reference_point")
         if point is not None and point.get("sign", "positive") not in ("positive", "negative"):
             raise ValueError("predictor.sign_reference_point.sign must be positive or negative")
+        if pred.get("method") == "jet":
+            opts = pred.get("jet") or {}
+            if opts.get("quantity", "latitude") not in ("latitude", "speed"):
+                raise ValueError("predictor.jet.quantity must be latitude or speed")
+            if opts.get("refine", "parabola") not in ("parabola", "none"):
+                raise ValueError("predictor.jet.refine must be parabola or none")
+            if not 0 < float(opts.get("min_valid", 0.8)) <= 1:
+                raise ValueError("predictor.jet.min_valid must be in (0, 1]")
+        if pred.get("method") == "amv":
+            if not 0 < float((pred.get("amv") or {}).get("min_coverage", 0.5)) <= 1:
+                raise ValueError("predictor.amv.min_coverage must be in (0, 1]")
         if pred.get("mask") not in (None, "ocean"):
             raise ValueError("predictor.mask must be null or ocean")
         for ds in pred["obs_datasets"]:

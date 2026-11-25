@@ -2,6 +2,11 @@
 Compute the predictor index for all observational datasets and all CMIP6 members/scenarios,
 and the merged observational index.
 
+Methods: `eof` (projection onto a pattern), `box` (box difference), `jet` (latitude or speed of the
+eddy-driven jet, `preprocess.indices.jet`; option `predictor.jet: {quantity: latitude | speed, refine:
+parabola | none, mask: <configs/masks name>, min_valid}`), `amv` (area mean over `predictor.domain`, e.g.
+the AMV, `preprocess.indices.amv`; option `predictor.amv: {min_coverage}`).
+
 With `predictor.remove_global_mean` the global-mean field (`<variable>_global_mean`, e.g. global-mean
 SST for the PDO) is subtracted from every field before fitting and projecting the pattern. With
 `predictor.mask: ocean` the field is restricted to the ocean (mask from ERA5 SST), e.g. for a PDO-like
@@ -28,11 +33,11 @@ from climate_scenarios_2050.core import domain as dom
 from climate_scenarios_2050.core.config import index_cfg, index_names, predictor_field
 from climate_scenarios_2050.core.io import StepOutput, write_netcdf
 from climate_scenarios_2050.preprocess import cmip6, masks, obs
-from climate_scenarios_2050.preprocess.indices import box, eof
+from climate_scenarios_2050.preprocess.indices import amv, box, eof, jet
 
 log = logging.getLogger(__name__)
 
-IMPLEMENTED = ["eof", "box"]
+IMPLEMENTED = ["eof", "box", "jet", "amv"]
 PLOT_ONLY = {"predictor": ["reference_skill"]}   # settings that only change figures
 
 
@@ -95,15 +100,37 @@ class IndexCalculator:
             fl = out.path(f"pattern_{self.ref_name}.nc")
             if not fl.exists():
                 write_netcdf(self.reference, fl, cfg)
+        elif self.pred["method"] == "jet":
+            self.jet = jet.options(self.pred)
+            o = self.jet
+            self.reference = jet.reference_stats(ref_field, o["quantity"], self.pred["normal_period"], o["refine"], o["mask"], o["min_valid"])
+        elif self.pred["method"] == "amv":
+            self.amv = amv.options(self.pred)
+            self.reference = amv.reference_stats(ref_field, self.pred["normal_period"], self.ref_clim, self.amv["min_coverage"])
         else:
             self.reference = box.reference_stats(ref_field, self.pred["box"], self.pred["normal_period"], self.ref_clim)
 
     def __call__(self, field: xr.DataArray, name: str, out: StepOutput = None) -> xr.DataArray:
         """`out`: where own patterns are written (default: the observed-index output)"""
         field = masks.apply(self.cfg, _domain(field, self.pred["domain"]), self.pred.get("mask"))
+        if self.pred["method"] == "jet":
+            o = self.jet
+            index, clim = jet.project(field, self.reference, o["quantity"], self.pred["normal_period"], o["refine"], o["mask"], o["min_valid"])
+            index = self._attrs(index)
+            index.attrs.update({"quantity": o["quantity"], "refine": o["refine"], "raw_units": jet.QUANTITIES[o["quantity"]],
+                                "mask": (self.pred.get("jet") or {}).get("mask") or "none", "min_valid": o["min_valid"],
+                                "reference_std": self.reference["std"], "reference_mean": self.reference["mean"]})
+            if "member" not in index.dims:
+                index.attrs["raw_climatology"] = clim
+            return index
         clim = eof.normal_period_climatology(field, self.pred["normal_period"])
         if self.pred["method"] == "box":
             return self._attrs(box.project(field, self.reference, self.pred["box"], clim))
+        if self.pred["method"] == "amv":
+            index = self._attrs(amv.project(field, self.reference, clim, self.amv["min_coverage"]))
+            index.attrs.update({"min_coverage": self.amv["min_coverage"], "reference_std": float(self.reference["score_std"]),
+                                "raw_units": field.attrs.get("units", "")})
+            return index
         mode = self.pred["mode"]
         pattern = self.reference
         if self.pred["pattern_source"] == "own":

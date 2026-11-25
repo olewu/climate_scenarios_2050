@@ -178,3 +178,45 @@ def test_run_defers_files_of_paused_servers(server, tmp_path, monkeypatch):
     assert (df["status"] == "done").sum() == 4 and (df["status"] == "failed").sum() == 4
     logged = [json.loads(line) for line in open(inventory / "download_log.jsonl")]
     assert len(logged) == 8 and not any(r["status"] == "deferred" for r in logged)
+
+
+def test_run_files_fetches_only_listed_files(server, tmp_path, monkeypatch):
+    """a file list: only the listed (deleted) files of a dataset, copies of the avoided host last, existing files kept"""
+    from climate_scenarios_2050.core.config import load_config
+
+    root, url = server
+    files = []
+    for i in range(3):
+        content = f"file {i}".encode()
+        (root / f"f{i}.nc").write_bytes(content)
+        files.append({"name": f"psl_Amon_M_ssp245_r1i1p1f1_gn_{2015 + i}01-{2015 + i}12.nc", "checksum": hashlib.sha256(content).hexdigest(),
+                      "checksum_type": "SHA256", "urls": [f"http://bad.example/f{i}.nc", f"{url}/f{i}.nc"], "opendap": []})
+    seen = []
+    monkeypatch.setattr(dl, "dataset_files", lambda row, *a, **k: seen.append(dict(row)) or files)
+    archive = tmp_path / "archive"
+    folder = archive / "ssp245" / "M" / "psl"
+    folder.mkdir(parents=True)
+    (folder / files[2]["name"]).write_bytes(b"kept")
+    listing = tmp_path / "list.txt"
+    listing.write_text("# comment\n" + "\n".join(f"{folder / files[i]['name']} v20200101 bad.example" for i in (1, 2)) + "\n")
+    inventory = tmp_path / "inventory"
+    inventory.mkdir()
+    cfg = load_config()
+    cfg["download"].update({"workers": 1, "min_request_interval": 0.0})
+    df = dl.run_files(cfg, listing, target=archive, inventory=inventory)
+    assert len(seen) == 1 and seen[0]["version"] == "20200101"
+    assert dict(zip(df["file"], df["status"])) == {files[1]["name"]: "done", files[2]["name"]: "exists"}
+    assert df.loc[df["status"] == "done", "url"].iloc[0].startswith(url)       # the avoided host was not needed
+    assert not (folder / files[0]["name"]).exists() and (folder / files[2]["name"]).read_bytes() == b"kept"
+
+
+def test_subset_value_limit(tmp_path):
+    import numpy as np
+    import xarray as xr
+
+    ds = xr.Dataset({"ua": (("time", "lat"), np.full((12, 3), 5.0))})
+    ds["ua"][4, 1] = 4.4e15
+    spec = {"tag": "t", "max_abs": 150}
+    file = {"name": "ua_Amon_M_historical_r1i1p1f1_gn_185001-185012.nc", "checksum": "x"}
+    with pytest.raises(ValueError, match="values above 150"):
+        dl._write_subset(ds, file, "src", tmp_path / "p.nc", tmp_path / "d.nc", "ua", spec, {}, "opendap")

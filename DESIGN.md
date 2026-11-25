@@ -1,6 +1,8 @@
 # Restructuring design: decadal wind prediction from CMIP6 NAO analogues
 
-Status: step 1 (preprocessing) implemented and tested on a subset; steps 2-7 not yet implemented.
+Status (Nov 2026): all steps implemented (CMIP6 inventory/download, preprocessing, split, index hindcast and
+evaluation, linear model, target hindcast and evaluation, forecast, index update); predictors NAO/EA (EOF),
+station NAO (box), jet latitude/speed, SST/tas-based EOF indices (PDO) and area means (AMV from tas, DCENT).
 
 ## 1. Goal
 
@@ -12,14 +14,66 @@ Forecast methods (all per CMIP6 scenario):
 
 | ID | Method | Wind from | Needs linear model |
 |----|--------|-----------|--------------------|
+| M0 | Return to the long-term mean: the internal anomaly of the last 20 years vanishes (+ forced part) | observations (internal reference) | no |
 | M1 | Persistence of the last 20 years (zero change) | observations | no |
+| M0c | Observations only: return to the observed mean of the years up to init | observations | no |
+| M0t | Observations only: observed linear trend up to init, read at the target window | observations | no |
 | M2a | All CMIP6 members, sfcWind directly | CMIP6 sfcWind | no |
 | M2b | All CMIP6 members, NAO -> linear model | CMIP6 NAO | yes |
 | M3a | NAO-analogue members, sfcWind directly | CMIP6 sfcWind | no |
 | M3b | NAO-analogue members, NAO -> linear model | CMIP6 NAO | yes |
+| perfect_index | Linear model given the observed index in the target window (upper limit, not a forecast) | observed index | yes |
+
+Data each method needs for its prediction (NAO/sfcWind/wsp100 as the example; other indices and targets
+analogously). "Observed target" = the monthly target record (e.g. GWA-scaled ERA5 wsp100, 1940-); "observed
+index (training)" = `obs.training_index` (ERA5, consistent with the target); "observed index (matching)" =
+`obs.matching_index` (long record, e.g. HadSLP/ERA5 merged); "CMIP6 index" = the index of every member
+(historical + scenario), its MMEM giving the forced part of the index; "CMIP6 target variable" = the target's
+CMIP6 field (`targets.<name>.cmip6`, e.g. sfcWind) of every member.
+
+| ID | Observations | CMIP6 | Forced part (full target) |
+|----|--------------|-------|---------------------------|
+| M0 | observed target (internal reference anomaly; spread: RMS of its own errors, i.e. of the internal window means) | CMIP6 index MMEM or CMIP6 target-variable MMEM (for the split, see right) | `a`: index MMEM regression (`forced: index`) or scaled MMEM of the CMIP6 target variable (`forced: cmip6`) |
+| M1 | observed target (reference mean; spread: RMS of the observed changes) | - | - (no change) |
+| M0c | observed target (mean of the years up to init and reference mean; spread: RMS of its own errors) | - | constant (observed mean) |
+| M0t | observed target (linear trend fit up to init and reference mean; spread: RMS of its own errors) | - | observed linear trend |
+| M2a | - | CMIP6 target variable, all members | in the members' own change |
+| M3a | observed index (matching) | CMIP6 index (selection) + CMIP6 target variable of the selected members | in the members' own change |
+| M2b | observed target + observed index (training) for the linear model | CMIP6 index, all members | `a` (default), or `b`: CMIP6 target-variable MMEM change (needs the CMIP6 target variable) |
+| M3b | as M2b, plus observed index (matching) | CMIP6 index (selection and predictor) | as M2b |
+| perfect_index | observed target + observed index (training), incl. the index in the target window | - | `a` |
+
+Every method is verified against the observed target; the `internal` target and M0 also need the forced
+estimate of the split (CMIP6 index MMEM, or the CMIP6 target-variable MMEM for `forced: cmip6`). Wind energy has
+no CMIP6 variable: M2a/M3a, option `b` and `forced: cmip6` are not available for it.
 
 M2b vs M3b isolates the value of the analogue selection; M3a vs M3b isolates the value of the
-statistical model vs model wind. Wind energy is only possible for M1, M2b, M3b.
+statistical model vs model wind. Wind energy is only possible for M0, M1, M2b, M3b.
+
+M0c and M0t (`evaluation.obs_methods`, full target only) are the cheapest references: M0 with the forced part
+estimated from the observed target alone, a constant (M0c) or a linear trend (M0t), fitted on the years up to init
+(`fit: up_to_init`, a real forecast; `leave_out`: all years except target window and reference, as M0). They show
+whether the CMIP6-based methods are worth their data. Both are linear in the observations, so the surrogate test
+(beyond M0) rebuilds them for every surrogate; `significance_m1.nc` tests every method against M1 (paired block
+bootstrap of the score differences over the init years).
+
+M0 is the baseline without index information, and the null hypothesis of the significance test. The internal
+part of the target has zero mean over the fitting years, so the expected internal level of the target window is
+zero: the predicted internal change is minus the observed internal anomaly of the reference period (the 20 years
+before init, from the leave-out split without the target window and reference). On the full target the forced
+change is added, the same forced part `a` as for M2b/M3b (the forced part of the target's split:
+`targets.<name>.forced: index` regression on the index MMEM, `cmip6` the scaled MMEM of the target's CMIP6
+variable). M0 thus differs from M1 (persistence) by assuming complete reversion of the recent internal anomaly.
+Its spread is the RMS of its own errors over the non-overlapping samples (`evaluation.m0_spread: own_errors`), as
+for M1, M0c and M0t, so that all no-information references are calibrated the same way. M0's error is the observed
+internal window mean (it predicts internal = 0; the forced part cancels on the full target), so this is the typical
+size of the internal window means, estimated with the same leave-out fits as the evaluation. Until 2026-11-24 the
+evaluation used the linear model's residual spread σ_LM, which leaves out the index-explained variance (too narrow:
+1.15 % instead of 1.76 % for wsp100, window 1-10, and a too low CRPSS of M0); the forecast used
+√(σ_LM² + β′ var(W[I]) β). The forecast now uses the RMS of M0's errors at earlier, complete windows.
+Skill beyond M0 (dcorr, dcrpss, corr_anom) is the skill a method gets from predicting the departure from this
+reversion, i.e. from the index (M2b/M3b) or from the selected members' own change (M3a). In the forecasts the
+forced part of M0 follows `forced_target` (index_mmem | cmip6_mmem | none), as for M2b/M3b.
 
 ## 2. Decisions (from review, Oct 2026)
 
@@ -66,6 +120,13 @@ statistical model vs model wind. Wind energy is only possible for M1, M2b, M3b.
 - **Observations, leakage**: default C = means and regression coefficients fitted on all years
   except the verified window and its reference period; option A = full period (old behaviour).
   For actual forecasts all data up to init is used. CMIP6 splits stay in-sample (1850-2100).
+- **Forced part of the observed targets** (`targets.<name>.forced`): `index` (default; wind, energy) regresses
+  the target on the predictor's MMEM (season t-1 for year t), as designed for wind/energy (no CMIP6 variable
+  needed, and the "b" methods would make sfcWind projections unnecessary). `cmip6` (tas, pr) regresses each grid
+  point on the MMEM of the target's own CMIP6 variable (year t, regridded to the target grid, regressor centred),
+  with the same leave-out cases. With `index`, tas kept almost all of its warming in the "internal" part
+  (Europe, 1-10: internal reference means -0.7 K in 1960-85 rising to +0.8 K in 2015), which made persistence
+  beat M0 and gave M3a spurious internal skill; with `cmip6` the internal means stay within +-0.15 K.
 - **Scenarios are kept separate** (own ensemble, MMEM, split, analogue pool, hindcasts).
   Hindcast evaluation: ssp245 and ssp370. Forecasts: all scenarios side by side.
 
@@ -106,8 +167,8 @@ One configurable generator:
 ### Predictors
 Generic index interface (`predictor`): an index = (variable, aggregation, domain, method), computed
 for the observational datasets `predictor.obs_datasets` (read as described in `obs_sources`) and
-all CMIP6 members. Methods: EOF mode k projected on a common pattern, box difference (station NAO);
-jet latitude/speed (`ua` at 850 hPa) still to come. NAO-only parts are optional settings of the
+all CMIP6 members. Methods: EOF mode k projected on a common pattern, box difference (station NAO),
+jet latitude/speed (`ua` at 850 hPa, see below), area mean (`method: amv`, see below). NAO-only parts are optional settings of the
 predictor or of `obs`: the HadSLP/ERA5 merge (`obs.merge`, null to switch off), the DCPP marker
 (`predictor.reference_skill`), the preselection lists.
 - SST predictors (e.g. PDO): `tos` from the CMIP6 table Omon (`cmip6.tables`); land points (NaN in
@@ -131,6 +192,22 @@ predictor or of `obs`: the HadSLP/ERA5 merge (`obs.merge`, null to switch off), 
   index is the primary one: its split removes the forced part of the targets.
 - Sign of a pattern: positive at `sign_reference_point`, or negative there with `sign: negative` in the
   point (EA in the CPC convention: `{lat: 55, lon: -20, sign: negative}`, EA+ = low west of the British Isles).
+- Jet indices (`predictor.method: jet`, `configs/experiments/jet.yaml`): latitude and speed of the maximum of
+  the DJFM 850 hPa zonal wind averaged over 0-60W, within 15-75N (Woollings et al. 2010 on seasonal means
+  instead of low-pass filtered daily data). Computed on the common 1.5 deg grid like the other indices
+  (native and regridded agree to corr 0.99 for the latitude, 1.00 for the speed), with a parabola through
+  the maximum for a continuous latitude. Anomaly indices: the own normal-period mean is removed (with CORR
+  matching an offset does not change the selection, and the targets are changes against each member's
+  own reference); the raw mean is stored as `raw_climatology` for comparing the models' jet with ERA5.
+  Below-ground points (850 hPa under Greenland and the Atlas) are missing in about half of the models and
+  extrapolated in ERA5/20CR: a fixed mask (`predictor.jet.mask`, `configs/masks/ua850_below_ground.nc`,
+  points missing in >= 3 of 49 models; its checksum enters the hashes) removes them from every dataset, and a
+  latitude needs 80 % of its unmasked longitudes (`min_valid`). The observed indices are unchanged by the
+  mask (the jet is never over Greenland in DJFM means).
+- Value checks of the native data (`cmip6.VALUE_CHECKS`, recorded in the store hash; so far `ua`): 0 and
+  1e20 count as missing, points with |u| > 150 m/s are corrupt (NaN; a member with a time step of > 1 % such
+  points is dropped). The OPeNDAP subsets from esgf.nci.org.au contain all-zero chunks and ~1e37 garbage
+  (71 of 51597 files); full files are checked against their checksum.
 - Analogues: matched jointly on `analogues.match_weights` (weighted mean of the per-index correlations,
   or root of the weighted mean of the squared errors for RMSE; one lag per member for all indices). The
   pool are the members with all needed indices; the hindcast stores every needed index (`index_<name>`).
@@ -205,7 +282,7 @@ src/climate_scenarios_2050/
                year/season/window conventions, resource settings, logging
   preprocess/  regrid.py (CMIP6 originals -> aggregated 1.5° zarr)
                obs.py (HadSLP, 20CR, ERA5 SLP loaders, season completeness checks)
-               indices/ (base interface; eof.py; box.py; jet.py, amv.py stubs)
+               indices/ (compute.py interface; eof.py; box.py; jet.py)
                merge.py (HadSLP/ERA5 harmonization)
   split/       forced.py (MMEM / polynomial / low-pass; model + obs scaling; leave-out C)
   analogues/   filters.py, matching.py (measures, subsample, shift, two-stage, pre-selection),
@@ -232,8 +309,35 @@ Each step is run as `pixi run <step> --config configs/default.yaml [--config con
 4. `linear-model` - index -> target per window length, leave-out.
 5. `hindcast-target` + `evaluate-target` - M0-M3b on the target windows, per target.
 6. `forecast --init-year Y` - all methods/scenarios, components stored.
+   `partition` (any time after `split`) - variance partition of the projected window changes into internal
+   variability, model and scenario uncertainty (Hawkins & Sutton 2009) per lead, for every index and for area
+   means of the targets' CMIP6 fields over `partition.regions` (`partition.py`; one folder per index or
+   target/region, hash of `partition`, the split hashes or the CMIP6 field ids, `target.reference_length`).
 7. `update-index` - append new winter(s) to the observed index using the frozen pattern and
    frozen harmonization.
+
+`pixi run outputs [--config ...] [--step <step>] [--scenario ...] [--target-variable ...]` lists the output
+folders (hashes) of a configuration per step and case, and whether they exist (and have figures); it only
+computes hashes and writes nothing.
+
+`pixi run gallery [--config ...] [--name NAME]` registers a configuration ("experiment") on the comparison pages
+in `<figures>/gallery/` (https://ns9873k.web.sigma2.no/users/owul/climate_scenarios_2050/gallery/). It exports
+each evaluate-target folder once into one binary file (int16 maps, significance bit masks) plus a JSON index;
+the page fetches only the bytes of the maps shown (HTTP range requests) and draws them in the browser
+(experiments side by side, per-column method/window, difference column, values on hover, view in the URL).
+Exports are named after the folder hash (shared between experiments) and never rewritten; a folder whose
+significance test arrives later gets a second export (`_ss` next to `_s`). Three pages:
+- `index_skill.html`: index evaluation per experiment and index (skill per lead time with bootstrap bands and the
+  synthetic-null p95, window scores, hindcast overview by init and valid year); side by side or overlaid in one
+  chart. Exported as plain JSON per folder (a few 10 kB).
+- `linear_model.html`: maps of the linear model (skill given the observed index change; target change per 1 std
+  of the window-mean index, per predictor, in target units and %), with a difference column.
+- `target.html`: target skill maps (scores and statistics beyond M0 with significance dots).
+- `partition.html`: variance partition per experiment and quantity (stacked fractions, standard deviations per
+  source, multi-model mean change per scenario with the internal spread), per window length.
+The index page also shows the CRPS of the window changes and the CRPSS against `cmip6_all`, and per lead time the
+CRPSS against `cmip6_all` with a bootstrap band (`continuous_crps.nc` of evaluate-index: a separate file, so that
+existing folders get it on a rerun of the step without recomputing the rest).
 
 ## 4. Config schema
 
@@ -307,8 +411,19 @@ Earlier analogue skill results may change noticeably after fix 1.
 ## 7. Open points (not blocking)
 
 - Harmonization overlap period: HadSLP ends Dec 2019 (last complete DJFM 2018), ERA5 starts Jan 1940
-  (first complete DJFM 1940) -> default 1940-2018. 20CRv3 ends Dec 2015 (last DJFM 2014).
-- Observational SST dataset for AMV and download of CMIP6 `ua` for jet indices (later).
+  (first complete DJFM 1940) -> default 1940-2018. 20CRv3 (`prmsl`, `uwnd`) ends Dec 2015 (last DJFM 2014).
+- AMV index (`method: amv`, `configs/experiments/amv.yaml`): annual-mean tas over the North Atlantic ocean
+  (0-60N, 80W-0, ERA5 land-sea mask), cos-lat weighted mean of the anomalies, standardized with the DCENT
+  normal-period std (0.29 K). No detrending or low-pass filter in the index: the forced part is removed in
+  the split like for the NAO (each model mean and DCENT regressed on the AMV MMEM, y = c0 + c1 * MMEM, same
+  leave-out cases), the analogue matching filters. Variant: `predictor.remove_global_mean: true` (Trenberth
+  and Shea 2006; the field stores the global mean over the ocean). Observations: DCENT ensemble mean
+  (`obs_sources.DCENT`, blended `temperature`), annual means of a point from >= 6 valid months
+  (`min_months`; complete years only would leave ~40 % of the box before 1900), nearest-neighbour regridding
+  (`regrid`; bilinear spreads the gaps); a year needs data at half the box area (`predictor.amv.min_coverage`),
+  which leaves 1861-1872 missing (coverage 40-47 %). Checked in memory: r = 0.999 with an AMV on the native
+  5 deg grid; MPI-ESM1-2-LR members follow DCENT's decadal course (cool 1860s/1970s, warm since 2000).
+  DCENT is too sparse in the North Pacific for an EOF before ~1950 (PDO: an infilled product).
 - Whether the NAO season Y (observed at init) should replace the analogue members' values in
   the NAO window for wind window 1-5 (default: no, use model values consistently).
 

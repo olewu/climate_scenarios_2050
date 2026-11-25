@@ -6,6 +6,8 @@ inputs:
   era5_monthly: /datalake/NS9873K/DATA/SFE/ERA5/res_monthly_1
   hadslp: /projects/NS9873K/owul/projects/climate_scenarios_2050/data/HadSLP/slp.mnmean.real.nc
   20cr: /projects/NS9873K/owul/projects/climate_scenarios_2050/data/20CRV3/prmsl.mon.mean.nc
+  20cr_uwnd: /projects/NS9873K/owul/projects/climate_scenarios_2050/data/20CRV3/uwnd.mon.mean.nc
+  dcent: /projects/NS9873K/owul/projects/climate_scenarios_2050/data/DCENT/DCENT_ensemble_1850_2025_ensemble_mean.nc
   # monthly observations of the prediction targets (ERA5-based: GWA-scaled 100 m wind speed, wind energy of one turbine type)
   targets:
     wsp100: /projects/NS9873K/www/scenarios_2050/wind_power_production_dataset/monthly_aggregation/wsp100_GWAscaled_1940-2026.nc

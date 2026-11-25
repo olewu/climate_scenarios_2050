@@ -11,10 +11,14 @@ Step 2: forced/internal split, per scenario (`<root>/split/<hash>/`, the scenari
     with wind targets (lag L = target.predictor_lag)
 - `target_<variable>_<hash>.nc` the same for an observed target (`coef_window` only for the hindcast
     scenarios), hash of the processed target input (a new target file gives new coefficients without
-    touching the rest); the design matrix uses the basis of season t-L for calendar year t
+    touching the rest). The forced part of the target (`targets.<name>.forced`):
+    `index` (default, wind/energy): the predictor's basis, season t-L for calendar year t
+    `cmip6`: per grid point the MMEM of the target's own CMIP6 variable in year t, regridded to the target
+    grid (stored as `basis_cmip6`); the file name ends in `_cmip6-<field id>` (members and settings of the
+    CMIP6 field)
 
-The split depends only on the predictor: the CMIP6 data of the targets enter in `hindcast-target`, so a
-download of e.g. more tas members leaves the split and the index steps unchanged.
+The split of the indices depends only on the predictor; with `forced: cmip6` the target coefficients also
+depend on the target's CMIP6 field.
 """
 
 import logging
@@ -53,8 +57,49 @@ def predictor_split_hashes(cfg, scenario: str):
     return {name: split_output(cfg, scenario, name).hash for name in dict.fromkeys([primary_index(cfg), *names])}
 
 
-def target_file(cfg, target_variable: str) -> str:
-    return f"target_{target_variable}_{obs.target_output(cfg, target_variable).hash}.nc"
+FORCED = ("index", "cmip6")
+
+
+def target_forced(cfg, target_variable: str) -> str:
+    """how the forced part of an observed target is estimated: index | cmip6"""
+    return target_spec(cfg, target_variable).get("forced", "index")
+
+
+def target_forced_id(cfg, scenario: str, target_variable: str):
+    """identifies the forced estimate of a target for downstream hashes (None for the default `index`)"""
+    if target_forced(cfg, target_variable) == "index":
+        return None
+    spec = target_spec(cfg, target_variable)
+    return {"forced": "cmip6", "cmip6_fields": cmip6.field_id(cfg, spec["cmip6"], "annual", scenario)}
+
+
+def target_file(cfg, target_variable: str, scenario: str) -> str:
+    name = f"target_{target_variable}_{obs.target_output(cfg, target_variable).hash}"
+    forced = target_forced_id(cfg, scenario, target_variable)
+    if forced:
+        name += f"_cmip6-{forced['cmip6_fields']}"
+    return name + ".nc"
+
+
+def cmip6_on_target_grid(da: xr.DataArray, like: xr.DataArray) -> xr.DataArray:
+    """CMIP6 field (..., lat, lon) bilinearly on the target grid (latitude, longitude), nearest value at the edges"""
+    lat, lon = like["latitude"].values, like["longitude"].values
+    linear = da.interp(lat=lat, lon=lon)
+    nearest = da.sel(lat=lat, lon=lon, method="nearest").assign_coords(lat=lat, lon=lon)
+    out = linear.fillna(nearest).rename(lat="latitude", lon="longitude")
+    return out.assign_coords(latitude=like["latitude"], longitude=like["longitude"])
+
+
+def target_cmip6_basis(cfg, scenario: str, target_variable: str, like: xr.DataArray) -> xr.DataArray:
+    """MMEM (year, latitude, longitude) of the target's CMIP6 variable on the target grid"""
+    from climate_scenarios_2050.methods.target import cmip6_mmem, open_cmip6_target
+
+    spec = target_spec(cfg, target_variable)
+    field = open_cmip6_target(cfg, spec["cmip6"], scenario)
+    if field is None:
+        raise FileNotFoundError(f"targets.{target_variable}.forced: cmip6 needs the preprocessed {spec['cmip6']} field of {scenario}")
+    mmem = cmip6_mmem(field, cfg["cmip6"]["weighting"])
+    return cmip6_on_target_grid(mmem, like).astype("float32").rename("basis_cmip6")
 
 
 def available_target_variables(cfg) -> list:
@@ -94,10 +139,9 @@ def index_coefficients(series: xr.DataArray, basis: xr.DataArray, cfg) -> xr.Dat
     return xr.Dataset(out)
 
 
-def target_coefficients(wind: xr.DataArray, basis: xr.DataArray, cfg, with_windows: bool) -> xr.Dataset:
-    """all leakage cases for observed annual wind (calendar years, paired with the previous season's basis)"""
+def target_coefficients(wind: xr.DataArray, design: xr.DataArray, cfg, with_windows: bool) -> xr.Dataset:
+    """all leakage cases for an observed annual target (calendar years) and its design matrix"""
     years = wind.year.values
-    design = fc.design_matrix(basis, years, lag=cfg["target"]["predictor_lag"])
     min_years = cfg["split"]["min_fit_years"]
     out = {
         "coef_full": fc.fit_coefficients(wind, design, fc.full_period_exclusions(years), min_years),
@@ -111,11 +155,18 @@ def target_coefficients(wind: xr.DataArray, basis: xr.DataArray, cfg, with_windo
 
 def ensure_target_coefficients(cfg, scenario: str, out, basis, target_variable: str):
     """forced-fit coefficients of the observed target; computed if the target input is new (a few minutes)"""
-    fl = out.path(target_file(cfg, target_variable))
+    fl = out.path(target_file(cfg, target_variable, scenario))
     if not fl.exists():
-        log.info(f"split {scenario}: forced-fit coefficients for the current {target_variable} input -> {fl.name}")
+        forced = target_forced(cfg, target_variable)
+        log.info(f"split {scenario}: forced-fit coefficients ({forced}) for the current {target_variable} input -> {fl.name}")
         with_windows = scenario in cfg["cmip6"]["scenarios_hindcast"]
-        coefs = target_coefficients(obs.open_obs_target(cfg, target_variable), basis, cfg, with_windows)
+        wind = obs.open_obs_target(cfg, target_variable)
+        if forced == "cmip6":
+            field = target_cmip6_basis(cfg, scenario, target_variable, wind)
+            coefs = target_coefficients(wind, fc.pointwise_design(field, wind.year.values), cfg, with_windows)
+            coefs["basis_cmip6"] = field
+        else:
+            coefs = target_coefficients(wind, fc.design_matrix(basis, wind.year.values, lag=cfg["target"]["predictor_lag"]), cfg, with_windows)
         write_netcdf(coefs, fl, cfg, compress=True)
     return fl
 
@@ -191,6 +242,11 @@ class SplitResults:
         fl = ensure_target_coefficients(self.cfg, self.scenario, self.out, self.basis, target_variable)
         return xr.open_dataset(fl)[case]
 
-    def target_design(self, years) -> xr.DataArray:
-        return fc.design_matrix(self.basis, years, lag=self.cfg["target"]["predictor_lag"])
+    def target_design(self, target_variable: str, years) -> xr.DataArray:
+        """design matrix of the target's forced fit: (year, term), or (year, term, latitude, longitude) for `forced: cmip6`"""
+        if target_forced(self.cfg, target_variable) == "index":
+            return fc.design_matrix(self.basis, years, lag=self.cfg["target"]["predictor_lag"])
+        fl = ensure_target_coefficients(self.cfg, self.scenario, self.out, self.basis, target_variable)
+        with xr.open_dataset(fl) as ds:
+            return fc.pointwise_design(ds["basis_cmip6"].load(), years)
 

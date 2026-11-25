@@ -1,0 +1,15 @@
+cmip6:
+  scenarios_hindcast: [ssp245]
+
+analogues:
+  selection: shift                 # subsample | shift | shift_subsample
+  measure: two_stage                        # CORR | RMSE | two_stage
+  filter: {type: bandpass, order: 4, cutoff_periods: [20,50], min_periods_frac: 0.25}   # or {type: lowpass/bandpass, cutoff_periods: [...], order: 4}
+  max_lag: 25                          # shift selection
+  preselection: null                   # null | varsplit_<N>y | Smith_incl_best | Smith_excl_worst | NAO_AR1_D2.5
+  model_filter_at_init: full           # full: centred filter over the whole model series (no observed future is used, the
+                                       # selection constrains the members' next years to the recent observed state)
+                                       # cut: model series cut at init and filtered like the observations (no skill)
+  max_lead: 37                         # 33 + half of the running mean of the continuous evaluation
+
+synthetic_null: {enabled: false}

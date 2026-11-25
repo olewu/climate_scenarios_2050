@@ -24,7 +24,7 @@ from climate_scenarios_2050.preprocess.cmip6 import cut_native, get_regridder, g
 
 log = logging.getLogger(__name__)
 
-CMIP6_UNITS = {"psl": "Pa", "tas": "K", "pr": "kg m-2 s-1", "sfcWind": "m s-1", "tos": "degC"}
+CMIP6_UNITS = {"psl": "Pa", "tas": "K", "pr": "kg m-2 s-1", "sfcWind": "m s-1", "tos": "degC", "ua": "m s-1"}
 
 
 def _prep_era5(ds):
@@ -62,10 +62,17 @@ def open_obs_dataset(cfg, dataset: str, variable: str, files=None) -> xr.Dataset
         # only the variable itself: some files carry extra variables (e.g. `date`) that would conflict
         ds = xr.open_mfdataset(files, preprocess=lambda d: _prep_era5(d)[[spec["name"]]].reset_coords(drop=True), combine="nested", concat_dim="time", parallel=False)
     elif kind == "file":
-        ds = xr.open_dataset(cfg["paths"]["inputs"][cfg["obs_sources"][dataset]["path"]], chunks={"time": 120})
+        # the file of the variable (`path` of the variable, else of the dataset; keys of paths.inputs)
+        path = spec.get("path") or cfg["obs_sources"][dataset]["path"]
+        ds = xr.open_dataset(cfg["paths"]["inputs"][path], chunks={"time": 120})
     else:
         raise ValueError(f"obs_sources.{dataset}: unknown kind {kind}")
-    ds = standardize_coords(ds[[spec["name"]]])
+    ds = ds[[spec["name"]]]
+    if "level" in spec:
+        # one pressure level of a multi-level file (e.g. 20CR uwnd), in the units of the file's level coordinate
+        dim = spec.get("level_dim", "level")
+        ds = ds.sel({dim: spec["level"]}).drop_vars(dim)
+    ds = standardize_coords(ds)
     da = ds[spec["name"]] * spec.get("factor", 1.0) + spec.get("offset", 0.0)
     da.attrs = {"units": CMIP6_UNITS.get(variable, ""), "source": dataset}
     return da.rename(variable).to_dataset()
@@ -108,16 +115,20 @@ def process_obs_field(cfg, dataset: str, field: str, overwrite=False):
     tgt = target_grid(cfg["preprocess"]["grid_spacing"], fcfg["domain"])
     monthly = open_obs_monthly(cfg, dataset, variable, fcfg["domain"], with_global_mean=with_gm)
     monthly, gm = monthly if with_gm else (monthly, None)
-    weights_file = out.dir / "regrid_weights" / f"{dataset}_{grid_key(monthly)}_{fcfg['method']}.nc"
-    regridder = get_regridder(monthly, tgt, fcfg["method"], weights_file)
+    # per dataset: regridding method (e.g. nearest_s2d for a coarse grid with gaps, where bilinear would spread
+    # every gap to the neighbouring points) and partial seasons of anomaly data (`min_months`)
+    spec = source_variable(cfg, dataset, variable)
+    method = spec.get("regrid", fcfg["method"])
+    weights_file = out.dir / "regrid_weights" / f"{dataset}_{grid_key(monthly)}_{method}.nc"
+    regridder = get_regridder(monthly, tgt, method, weights_file)
     for agg in todo:
         months = fcfg["aggregations"][agg]
         fl = out.path(f"{dataset}_{field}_{agg}.nc")
-        seas = regridder(seasonal_mean(monthly, months), keep_attrs=True).astype("float32")
+        seas = regridder(seasonal_mean(monthly, months, min_months=spec.get("min_months")), keep_attrs=True).astype("float32")
         seas.attrs.update({"dataset": dataset, "aggregation": agg, "months": str(months)})
         ds = seas.to_dataset(name=variable)
         if gm is not None:
-            ds[f"{variable}_global_mean"] = seasonal_mean(gm, months).astype("float32").reindex(year=ds.year)
+            ds[f"{variable}_global_mean"] = seasonal_mean(gm, months, min_months=spec.get("min_months")).astype("float32").reindex(year=ds.year)
         write_netcdf(ds, fl, cfg, overwrite=overwrite)
         log.info(f"wrote {fl} ({int(seas.year.min())}-{int(seas.year.max())})")
     return out
@@ -134,7 +145,8 @@ def open_obs_field(cfg, dataset: str, field: str, aggregation: str, with_global_
 
 #---------------prediction targets--------------#
 def target_output(cfg, target_variable: str) -> StepOutput:
-    spec = target_spec(cfg, target_variable)
+    # `forced` only concerns the split, not the target data
+    spec = {k: v for k, v in target_spec(cfg, target_variable).items() if k != "forced"}
     extra = {"target_variable": target_variable, "spec": spec, "domain": cfg["region"]["domain"]}
     if spec["source"] == "file":
         extra["file"] = cfg["paths"]["inputs"]["targets"][spec["file"]]

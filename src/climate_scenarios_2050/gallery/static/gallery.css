@@ -1,0 +1,36 @@
+:root { --fg: #1d1d1f; --muted: #666; --line: #d0d0d0; --bg: #fff; --panel: #f6f6f7; --accent: #2a5db0; }
+body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(--bg); margin: 0; padding: 12px 16px 40px; }
+h1 { font-size: 17px; margin: 0 0 4px; }
+nav a { color: var(--accent); margin-right: 12px; }
+.bar { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: end; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; margin: 10px 0; }
+.bar label { display: flex; flex-direction: column; font-size: 11px; color: var(--muted); }
+.bar select, .bar input { font: inherit; margin-top: 2px; max-width: 260px; }
+.bar input[type=number] { width: 64px; }
+.bar .check { flex-direction: row; align-items: center; gap: 4px; color: var(--fg); font-size: 12px; }
+.cols { display: flex; flex-wrap: wrap; gap: 14px; }
+.col { border: 1px solid var(--line); border-radius: 6px; padding: 8px; }
+.col .head { display: flex; flex-wrap: wrap; gap: 6px; align-items: end; margin-bottom: 6px; }
+.col .head label { display: flex; flex-direction: column; font-size: 11px; color: var(--muted); }
+.col .title { font-weight: 600; min-height: 18px; }
+.col .sub { color: var(--muted); font-size: 12px; min-height: 17px; white-space: pre-line; }
+.col .msg { color: #a33; padding: 30px 6px; }
+.col .hover { font-size: 12px; min-height: 17px; font-variant-numeric: tabular-nums; }
+.col.diff { background: #fbfbf4; }
+canvas.map { display: block; cursor: crosshair; }
+.note { color: var(--muted); font-size: 12px; max-width: 1100px; }
+button { font: inherit; }
+.legend { font-size: 11px; display: flex; flex-wrap: wrap; gap: 2px 10px; max-width: 640px; }
+.legend span { display: inline-flex; align-items: center; gap: 3px; }
+.chart { margin-bottom: 4px; }
+.checks { display: flex; flex-wrap: wrap; gap: 2px 10px; font-size: 12px; }
+.checks label { flex-direction: row; align-items: center; gap: 3px; color: var(--fg); font-size: 12px; }
+.chart canvas, .chart svg { display: block; }
+.defs { border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; margin: 0 0 10px; max-width: 1200px; background: #fcfcfd; }
+.defs summary { cursor: pointer; font-weight: 600; }
+.defs table { border-collapse: collapse; margin: 4px 0 6px; }
+.defs td { padding: 2px 10px 2px 0; vertical-align: top; }
+.defs td:first-child { font-weight: 600; white-space: nowrap; }
+.defs tr.sel td { background: #fff6d6; }
+.defs .f { font-family: "Cambria Math", "STIX Two Math", Georgia, serif; font-size: 14px; }
+.defs .muted { color: var(--muted); font-size: 12px; }
+.defs h4 { margin: 8px 0 2px; font-size: 13px; }

@@ -8,6 +8,7 @@ Safe output handling.
   holds the resolved configuration subset and the upstream hashes.
 """
 
+import contextlib
 import logging
 import shutil
 from pathlib import Path
@@ -26,6 +27,20 @@ HASH_NEUTRAL = {
 }
 
 
+_READ_ONLY = False
+
+
+@contextlib.contextmanager
+def read_only():
+    """within this block StepOutput.prepare() creates nothing and no file can be written (hash lookups)"""
+    global _READ_ONLY
+    previous, _READ_ONLY = _READ_ONLY, True
+    try:
+        yield
+    finally:
+        _READ_ONLY = previous
+
+
 def output_roots(cfg) -> list:
     return [Path(p).resolve() for p in cfg["paths"]["outputs"].values()]
 
@@ -35,6 +50,8 @@ def ensure_writable(path, cfg, overwrite=False) -> Path:
     check that `path` lies below one of the output roots and does not exist yet
     (or remove it if `overwrite` is set)
     """
+    if _READ_ONLY:
+        raise PermissionError(f"refusing to write {path}: read-only mode")
     path = Path(path).resolve()
     if not any(root == path or root in path.parents for root in output_roots(cfg)):
         raise PermissionError(f"refusing to write {path}: not below any output root in paths.yaml")
@@ -104,7 +121,9 @@ class StepOutput:
         self.dir = Path(cfg["paths"]["outputs"][root_key]) / step / self.hash
 
     def prepare(self):
-        """create the folder and write/compare the config record"""
+        """create the folder and write/compare the config record (nothing in `read_only()` mode)"""
+        if _READ_ONLY:
+            return self
         record_file = self.dir / "config.yaml"
         if record_file.exists():
             with open(record_file) as f:

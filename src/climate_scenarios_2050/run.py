@@ -4,6 +4,9 @@ Command line entry point for all steps:
     python -m climate_scenarios_2050.run <step> [--config override.yaml ...] [options]
 
 e.g. `pixi run preprocess --config configs/experiments/eof2.yaml --part indices`.
+`pixi run outputs --config ... [--step linear-model]` lists the output folders (hashes) of a configuration,
+`pixi run gallery --config ... [--name NAME]` registers it on the comparison pages (`<figures>/gallery/`),
+`pixi run partition --config ...` computes the variance partition of the projections (indices and target regions).
 """
 
 import argparse
@@ -17,7 +20,7 @@ from climate_scenarios_2050.core.config import load_config, predictor_field
 
 log = logging.getLogger("climate_scenarios_2050")
 
-STEPS = ["cmip6-inventory", "cmip6-download", "preprocess", "split", "hindcast-index", "evaluate-index", "linear-model", "hindcast-target", "evaluate-target", "forecast", "update-index"]
+STEPS = ["cmip6-inventory", "cmip6-download", "preprocess", "split", "hindcast-index", "evaluate-index", "linear-model", "hindcast-target", "evaluate-target", "forecast", "partition", "update-index", "outputs", "gallery"]
 
 
 def setup_logging(cfg, step):
@@ -41,6 +44,9 @@ def run_cmip6_inventory(cfg, args):
 def run_cmip6_download(cfg, args):
     from climate_scenarios_2050.cmip_retrieval import download
 
+    if args.files:
+        download.run_files(cfg, args.files, target=args.target, inventory=args.inventory)
+        return
     download.run(cfg, target=args.target, inventory=args.inventory, variables=args.variable or None,
                  experiments=args.scenario or None, max_datasets=args.max_datasets)
 
@@ -112,10 +118,29 @@ def run_forecast(cfg, args):
     forecast.run(cfg, args.init_year, scenarios=args.scenario or None, target_variable=args.target_variable, windows=windows, site=site, reference_value=args.reference_value, reference_end=args.reference_end)
 
 
+def run_partition(cfg, args):
+    from climate_scenarios_2050 import partition
+
+    partition.run(cfg)
+
+
 def run_update_index(cfg, args):
     from climate_scenarios_2050.update import update_index
 
     update_index.run(cfg, files=args.era5_file or None)
+
+
+def run_outputs(cfg, args):
+    from climate_scenarios_2050 import outputs
+
+    windows = [tuple(int(v) for v in w.split("-")) for w in args.window] if args.window else None
+    outputs.run(cfg, steps=args.step_filter or None, scenarios=args.scenario or None, target_variable=args.target_variable, windows=windows)
+
+
+def run_gallery(cfg, args):
+    from climate_scenarios_2050.gallery import export
+
+    export.run(cfg, args.config, name=args.name, replace=args.replace)
 
 
 def main(argv=None):
@@ -128,6 +153,7 @@ def main(argv=None):
     parser.add_argument("--scenario", action="append", help="restrict to scenario(s) (cmip6-*: experiments, incl. historical)")
     parser.add_argument("--target", help="cmip6-download: archive root to write to (default: paths.inputs.cmip6)")
     parser.add_argument("--inventory", help="cmip6-download: inventory folder with plan.csv (default: the latest)")
+    parser.add_argument("--files", help="cmip6-download: list of files to fetch (lines: path [vYYYYMMDD [host tried last]]) instead of the plan")
     parser.add_argument("--max-datasets", type=int, help="cmip6-download: only the first n planned datasets (testing)")
     parser.add_argument("--init-year", type=int, help="forecast: initialization year")
     parser.add_argument("--window", action="append", help="forecast: target window a-b in lead years, e.g. 1-10 (default: target.windows)")
@@ -135,10 +161,18 @@ def main(argv=None):
     parser.add_argument("--site", help="forecast: lat,lon of a site for a table and figure")
     parser.add_argument("--reference-end", type=int, help="forecast: last year of the reference period (default: the init year, or the last year of the target record if earlier)")
     parser.add_argument("--reference-value", type=float, help="forecast: measured mean over the reference period, gives absolute changes at the site")
+    parser.add_argument("--step", dest="step_filter", action="append", choices=[s for s in STEPS if s not in ("cmip6-inventory", "cmip6-download", "update-index", "outputs", "gallery")],
+                        help="outputs: only the folders of these steps (default: all)")
+    parser.add_argument("--name", help="gallery: name of the experiment on the comparison pages (default: the config file names)")
+    parser.add_argument("--replace", action="store_true", help="gallery: re-register a name that has other config files")
     parser.add_argument("--era5-file", action="append", help="update-index: monthly ERA5 SLP file(s) (default: all files in paths.inputs.era5_monthly)")
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config, paths_file=args.paths)
+    if args.step == "outputs":   # a lookup: no log file
+        logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
+        run_outputs(cfg, args)
+        return
     setup_logging(cfg, args.step)
     log.info(f"step {args.step}, overrides {args.config}")
     dask.config.set(scheduler="threads", num_workers=cfg["resources"]["dask_threads"])
@@ -163,8 +197,12 @@ def main(argv=None):
         run_evaluate_target(cfg, args)
     elif args.step == "forecast":
         run_forecast(cfg, args)
+    elif args.step == "partition":
+        run_partition(cfg, args)
     elif args.step == "update-index":
         run_update_index(cfg, args)
+    elif args.step == "gallery":
+        run_gallery(cfg, args)
     else:
         raise NotImplementedError(f"step {args.step} is not implemented yet")
 

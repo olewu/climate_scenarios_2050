@@ -54,3 +54,8 @@ def test_gaussian_scores_perfect_forecast_beats_reference():
     spread = ev.persistence_spread(target, [(1, 10)])
     scores = ev.gaussian_scores(target, 0.1 * xr.ones_like(target), target, spread, (0.5,))
     assert (scores["crpss"] > 0.8).all() and (scores["bss"] > 0.8).all() and (scores["corr"] > 0.99).all()
+
+
+def test_site_table_without_sites_is_empty():
+    cfg = {"region": {"sites": {}, "domain": {"lon": [-85, -30], "lat": [-60, 15]}}, "resources": {"n_jobs": 1}}
+    assert len(ev.site_table(cfg, {}, {}, [(1, 5)]).data_vars) == 0

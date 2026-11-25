@@ -1,0 +1,48 @@
+# North Atlantic eddy-driven jet as predictor (Woollings et al. 2010, adapted to seasonal means): latitude and
+# speed of the maximum of the DJFM 850 hPa zonal wind averaged over 0-60W, between 15 and 75N, on the common
+# 1.5 deg grid (parabola through the maximum). Two indices: analogues matched on both, linear model on both.
+# Below-ground points (missing in about half of the models) are masked in all datasets.
+# Each index is an anomaly index (own normal-period mean removed, standardized with the ERA5 std); the raw
+# normal-period mean is stored as `raw_climatology` (degrees north or m/s).
+#
+# Observations: 20CRv3 (1836-2015) merged with ERA5 (from 1940) as HadSLP/ERA5 for the NAO. Needs
+# paths.inputs.20cr_uwnd (data/20CRV3/uwnd.mon.mean.nc) and the ERA5 850 hPa u files.
+# Preprocessing: pixi run preprocess --config configs/experiments/jet.yaml
+predictor:
+  name: jet_lat
+  method: jet
+  variable: ua
+  aggregation: DJFM
+  domain: {lon: [-60, 0], lat: [15, 75]}   # jet sector: mean over these longitudes, maximum within these latitudes
+  obs_datasets: [20CR, ERA5]
+  pattern_source: ERA5                     # reference dataset of the standardization
+  sign_reference_point: null
+  reference_skill: null                    # no DCPP reference for the jet
+  # mask: points where 850 hPa is below the ground (Greenland, Atlas) in >= 3 models, removed from all datasets
+  # (built from the ssp245 ua stores, see preprocess/indices/jet.py); min_valid: share of the unmasked
+  # longitudes a latitude needs
+  jet: {quantity: latitude, refine: parabola, mask: ua850_below_ground, min_valid: 0.8}
+  indices:
+    jet_lat: {jet: {quantity: latitude}}
+    jet_speed: {jet: {quantity: speed}}
+
+obs:
+  matching_index: merged
+  training_index: ERA5
+  merge:
+    datasets: [20CR, ERA5]
+    year: 1980                             # first season taken from ERA5
+    harmonization_period: [1940, 2015]     # overlap of 20CRv3 and ERA5
+
+analogues:
+  match_weights: {jet_lat: 0.5, jet_speed: 0.5}
+  # 20CRv3 starts in 1806, the CMIP6 members in 1850: first init with a complete 70-year window in both
+  # (init_years only looks at the observation years, see TODO.md)
+  first_init: 1919
+
+linear_model:
+  predictors: [jet_lat, jet_speed]
+  ridge: 0.0
+
+synthetic_null:
+  enabled: false

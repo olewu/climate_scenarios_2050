@@ -1,13 +1,16 @@
 # South America with the Pacific Decadal Oscillation (PDO) as predictor - template, not runnable yet:
-# - needs CMIP6 tos (Omon) in the archive (download: add tos to download.variables)
-# - with ERA5 SST alone (from 1940) a 70-year matching window leaves no useful hindcast inits; add a long
-#   SST reconstruction (e.g. DCENT) to obs_sources and paths.inputs, list it in predictor.obs_datasets
-#   and merge it with ERA5 (obs.merge), as HadSLP/ERA5 for the NAO
+# - needs CMIP6 tos (Omon) in the archive (download: add tos to download.variables and cmip6-download)
+# - with ERA5 SST alone (from 1940) a 70-year matching window leaves no useful hindcast inits; add an infilled
+#   SST reconstruction (e.g. ERSSTv5 or COBE-SST2; DCENT is too sparse in the North Pacific before ~1950) to
+#   obs_sources and paths.inputs, list it in predictor.obs_datasets and merge it with ERA5 (obs.merge), as
+#   HadSLP/ERA5 for the NAO
+# - the region changes the domain of the tas/pr/sfcWind fields: new stores, preprocess first
+# - tas/pr remove their own CMIP6 forced part (targets.<name>.forced: cmip6, default.yaml); ws10 the PDO MMEM
 region:
   name: south_america
   domain: {lon: [-85, -30], lat: [-60, 15]}
   targets: [tas, pr, ws10]             # no GWA-scaled wind outside Europe: ERA5 10 m wind speed
-  sites: {}
+  sites: {}                            # no site tables/figures
 
 predictor:
   name: pdo
@@ -25,5 +28,5 @@ predictor:
 obs:
   matching_index: ERA5
   training_index: ERA5
-  merge: null                          # e.g. {datasets: [DCENT, ERA5], year: 1980, harmonization_period: [1940, 2018]}
+  merge: null                          # e.g. {datasets: [ERSST, ERA5], year: 1980, harmonization_period: [1940, 2018]}
   target_variable: tas

@@ -18,6 +18,12 @@ is downloaded over HTTP with its checksum, cut locally and deleted (`subset_meth
 Every file is appended to `<inventory>/download_log.jsonl` as soon as it is done; a rerun skips files
 already in place.
 
+Single files (`--files <list>`, `run_files`): the inventory works per dataset, so a deleted file of a dataset
+that still has other files is never planned again. A list (one line per file: archive path, optionally the
+dataset version `vYYYYMMDD` and a host whose copies are tried last, `#` comments) is fetched file by file
+from the dataset records, e.g. to replace corrupt subsets: delete the files, then run the list. Without a
+version the latest version is taken.
+
 Unreachable servers: a connection that fails before any data arrived is not retried (only a broken
 transfer is resumed), and a server (HTTP or OPeNDAP service of a host) that fails `download.skip_host_after`
 times in a row is paused for `download.skip_host_minutes` and then probed again (shared between the workers).
@@ -59,7 +65,7 @@ def dataset_files(row, nodes, table) -> list:
     """[{name, size, checksum, checksum_type, urls}] of one planned dataset (all copies merged)"""
     facets = {"table_id": table, "variable_id": row["variable"], "experiment_id": row["experiment"], "source_id": row["model"],
               "variant_label": row["member"], "grid_label": row["grid"]}
-    version = f"v{int(row['version'])}"
+    version = None if pd.isna(row.get("version")) else f"v{int(str(row['version']).lstrip('v'))}"
     files = {}
     for node in nodes:
         try:
@@ -68,7 +74,9 @@ def dataset_files(row, nodes, table) -> list:
             log.warning(f"file search on {node} failed for {row['dataset_id']}: {exc!r}")
             continue
         for doc in docs:
-            if doc.get("retracted") in (True, "true") or version not in doc["instance_id"].split("."):
+            if doc.get("retracted") in (True, "true"):
+                continue
+            if (version not in doc["instance_id"].split(".")) if version else doc.get("latest") not in (True, "true"):
                 continue
             name = esgf.first(doc.get("title"))
             entry = files.setdefault(name, {"name": name, "size": int(esgf.first(doc.get("size")) or 0), "checksum": esgf.first(doc.get("checksum")),
@@ -277,8 +285,14 @@ def _write_subset(ds, file, source, partial: Path, destination: Path, variable, 
     """check a subset (every month present, no empty time step) and move it into place"""
     if ds.sizes["time"] != _months(file["name"]):
         raise ValueError(f"{ds.sizes['time']} time steps, expected {_months(file['name'])}")
-    if bool(ds[variable].isnull().all(dim=[d for d in ds[variable].dims if d != "time"]).any()):
+    space = [d for d in ds[variable].dims if d != "time"]
+    if bool(ds[variable].isnull().all(dim=space).any()):
         raise ValueError("time steps without data")
+    if bool((ds[variable] == 0).all(dim=space).any()):   # an OPeNDAP request answered with zeros (NCI, CNRM-CM6-1-HR)
+        raise ValueError("time steps with only zeros")
+    limit = spec.get("max_abs", 1e30)
+    if bool((np.abs(ds[variable]) > limit).any()):   # garbage values (~1e37, single points 1e5-1e15) in OPeNDAP answers
+        raise ValueError(f"values above {limit:g} (|{variable}|)")
     ds.attrs.update({"subset": spec["tag"], "subset_source": source, "subset_source_sha256": str(file["checksum"]), "subset_method": method})
     ds.to_netcdf(partial, encoding={variable: {"zlib": True, "complevel": 1, "dtype": "float32"}})
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -370,12 +384,65 @@ def run(cfg, target=None, inventory=None, variables=None, experiments=None, max_
             todo = todo[todo["experiment"] == "historical"]
     if max_datasets:
         todo = todo.head(max_datasets)
+    log_file = inventory / "download_log.jsonl"
+    log.info(f"{len(todo)} datasets ({todo['size'].sum() / 1e9:.1f} GB as full files) from plan {inventory} -> {target}, log {log_file}")
+    return fetch_datasets(cfg, todo, target, log_file)
+
+
+def read_file_list(list_file, subsets) -> pd.DataFrame:
+    """lines `<path> [vYYYYMMDD [host to try last]]` -> one row per file (dataset keys, file name, version, avoid)"""
+    rows = []
+    for line in Path(list_file).read_text().splitlines():
+        parts = line.split("#")[0].split()
+        if not parts:
+            continue
+        path = Path(parts[0])
+        name = path.name
+        for var, spec in subsets.items():
+            name = name.removesuffix(f"_{spec['tag']}.nc") + ".nc" if name.endswith(f"_{spec['tag']}.nc") else name
+        match = FILE_PATTERN.match(name)
+        if match is None:
+            raise ValueError(f"{list_file}: not a CMIP6 file name: {path.name}")
+        rows.append({**{k: match[k] for k in ["variable", "table", "experiment", "model", "member", "grid"]}, "name": name, "path": str(path),
+                     "version": parts[1].lstrip("v") if len(parts) > 1 else None, "avoid": parts[2] if len(parts) > 2 else None})
+    return pd.DataFrame(rows)
+
+
+def run_files(cfg, list_file, target=None, inventory=None) -> pd.DataFrame:
+    """download the files of a list (see the module docstring); files still in place are left alone"""
+    target = Path(target or cfg["paths"]["inputs"]["cmip6"])
+    wanted = read_file_list(list_file, cfg["download"].get("subsets") or {})
+    present = [p for p in wanted["path"] if Path(p).exists()]
+    if present:
+        log.warning(f"{len(present)} listed files still exist and are kept (delete them first to replace them), e.g. {present[0]}")
+    keys = ["variable", "table", "experiment", "model", "member", "grid", "version"]
+    todo = []
+    for key, group in wanted.groupby(keys, dropna=False, sort=True):
+        row = dict(zip(keys, key))
+        row["dataset_id"] = ".".join(["CMIP6", "*", row["model"], row["experiment"], row["member"], row["table"], row["variable"], row["grid"],
+                                      f"v{row['version']}" if isinstance(row["version"], str) else "latest"])
+        row["only"] = set(group["name"])
+        row["avoid"] = {h for h in group["avoid"] if isinstance(h, str)}
+        todo.append(row)
+    inventory = Path(inventory) if inventory else latest_inventory_dir(cfg)
+    log_file = inventory / "download_log.jsonl"
+    log.info(f"{len(wanted)} files of {len(todo)} datasets from {list_file} -> {target}, log {log_file}")
+    return fetch_datasets(cfg, pd.DataFrame(todo), target, log_file)
+
+
+def _avoid_last(urls, hosts):
+    return sorted(urls, key=lambda u: urlparse(u).netloc in hosts)
+
+
+def fetch_datasets(cfg, todo: pd.DataFrame, target: Path, log_file: Path) -> pd.DataFrame:
+    """
+    files of the datasets in `todo` (rows with variable, experiment, model, member, grid, version, dataset_id;
+    optional `only`: file names, `avoid`: hosts tried last)
+    """
+    dcfg = cfg["download"]
     partial_dir = target / ".partial"
     partial_dir.mkdir(parents=True, exist_ok=True)
-    log_file = inventory / "download_log.jsonl"
     subsets = dcfg.get("subsets") or {}
-    log.info(f"{len(todo)} datasets ({todo['size'].sum() / 1e9:.1f} GB as full files) from plan {inventory} -> {target}, log {log_file}")
-
     period = cfg["cmip6"]["period"]
     results, deferred, jobs = [], [], []
     handled = [0]   # callbacks run after `wait` may already have returned: count them
@@ -433,6 +500,14 @@ def run(cfg, target=None, inventory=None, variables=None, experiments=None, max_
                 if not files:
                     record_result({**base, "status": "failed", "error": error})
                     continue
+                only, avoid = row.get("only"), row.get("avoid")
+                if isinstance(only, set):
+                    missing = only - {f["name"] for f in files}
+                    if missing:
+                        record_result({**base, "status": "failed", "error": f"not in the dataset records: {', '.join(sorted(missing))}"})
+                    files = [f for f in files if f["name"] in only]
+                if isinstance(avoid, set) and avoid:
+                    files = [{**f, "urls": _avoid_last(f["urls"], avoid), "opendap": _avoid_last(f["opendap"], avoid)} for f in files]
                 for file in files:
                     if not in_period(file["name"], period):
                         continue

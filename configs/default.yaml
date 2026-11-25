@@ -36,16 +36,20 @@ region:
 #           a dataset of `obs_sources` (`variable` = CMIP6 name of the variable there)
 #   cmip6:  CMIP6 variable of the M2a/M3a methods and the CMIP6 forced estimate (null: none)
 #   change: relative (%) | absolute (units of the target)
+# forced: how the forced part of the observed target is removed in the split. index (default): regression on
+# the predictor's MMEM (e.g. the NAO MMEM; designed for wind and energy, needs no CMIP6 target variable);
+# cmip6: per grid point on the MMEM of the target's own CMIP6 variable (`cmip6`; needed for tas/pr, whose forced
+# trend the NAO MMEM cannot represent)
 targets:
   wsp100: {source: file, file: wsp100, variable: wsp100, cmip6: sfcWind, change: relative}   # GWA-scaled 100 m wind, Europe only
   energy: {source: file, file: energy, variable: energy, cmip6: null, change: relative}      # wind energy of one turbine type, Europe only
-  tas: {source: ERA5, variable: tas, cmip6: tas, change: absolute}
-  pr: {source: ERA5, variable: pr, cmip6: pr, change: relative}
+  tas: {source: ERA5, variable: tas, cmip6: tas, change: absolute, forced: cmip6}
+  pr: {source: ERA5, variable: pr, cmip6: pr, change: relative, forced: cmip6}
   ws10: {source: ERA5, variable: sfcWind, cmip6: sfcWind, change: relative}                  # 10 m wind speed, any region
 
 # How the observational datasets are read: per variable the name in the files and the conversion to CMIP6
 # units (value * factor + offset). era5_monthly: one file per month in paths.inputs.era5_monthly/<folder>/;
-# file: one file, `path` = key of paths.inputs.
+# file: one file, `path` = key of paths.inputs (per variable if it has its own `path`); `level`: one level of a multi-level file.
 obs_sources:
   ERA5:
     kind: era5_monthly
@@ -54,9 +58,26 @@ obs_sources:
       tas: {folder: 2m_temperature, name: t2m}
       pr: {folder: total_precipitation, name: tp, factor: 0.0115740741}   # m/day -> kg m-2 s-1
       sfcWind: {folder: 10m_wind_speed, name: si10}
+      ua: {folder: u_component_of_wind_850hPa, name: u}                   # 850 hPa only
       tos: {folder: sea_surface_temperature, name: sst, offset: -273.15}  # K -> degC
   HadSLP: {kind: file, path: hadslp, variables: {psl: {name: slp, factor: 100.0}}}   # hPa -> Pa
-  20CR: {kind: file, path: 20cr, variables: {psl: {name: prmsl}}}
+  20CR:
+    kind: file
+    path: 20cr
+    variables:
+      psl: {name: prmsl}
+      ua: {name: uwnd, path: 20cr_uwnd, level: 850}                     # own file (paths.inputs.20cr_uwnd), 850 hPa of all levels
+  # DCENT (Chan et al. 2024): ensemble mean, monthly anomalies (vs 1982-2014) on a 5 deg grid from 1850, with gaps.
+  # tas: the blended field (SST over the ocean, LSAT over land). Per variable: `min_months` - annual means of a
+  # point from at least this many valid months (anomalies, no seasonal cycle; complete years only would leave
+  # ~40 % of the North Atlantic before 1900); `regrid` - nearest neighbour (bilinear would spread every gap
+  # to the neighbouring points of the 1.5 deg grid)
+  DCENT:
+    kind: file
+    path: dcent
+    variables:
+      tas: {name: temperature, min_months: 6, regrid: nearest_s2d}
+      tos: {name: sst, min_months: 6, regrid: nearest_s2d}
 
 #---------------step 0: CMIP6 download (not hashed; `pixi run cmip6-inventory`, `pixi run cmip6-download`)--------------#
 download:
@@ -70,7 +91,7 @@ download:
   deferred_rounds: 8                   # files of paused servers: retried after each pause, at most this often
   min_request_interval: 1.0            # seconds between two requests to the same server (rate limits)
   subsets:                             # variables read as a subset through OPeNDAP, stored as <variable>_<tag>
-    ua: {plev: 85000, lat: [10, 80], tag: plev850_lat10-80}
+    ua: {plev: 85000, lat: [10, 80], tag: plev850_lat10-80, max_abs: 150}   # max_abs: larger values reject the subset (m/s)
 
 #---------------step 1: preprocessing--------------#
 preprocess:
@@ -99,6 +120,10 @@ preprocess:
       method: bilinear
       aggregations: {annual: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]}
       domain: region
+    ua:                   # 850 hPa subsets (download.subsets), jet index; lat inside 10-80N minus the 5 deg margin
+      method: bilinear
+      aggregations: {DJFM: [12, 1, 2, 3]}
+      domain: {lon: [-90, 40], lat: [15, 75]}
     tos:
       method: bilinear
       aggregations: {annual: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]}
@@ -107,7 +132,7 @@ preprocess:
 
 predictor:
   name: nao
-  method: eof             # eof | box (station-based) | jet, amv (not implemented yet)
+  method: eof             # eof | box (station-based) | jet | amv (area mean over the domain, configs/experiments/amv.yaml)
   variable: psl
   field: null                          # entry of preprocess.fields (null: the variable's own entry)
   aggregation: DJFM
@@ -205,6 +230,25 @@ evaluation:
     alpha: 0.05                        # global level; FDR at q = fdr_factor * alpha (Wilks 2016)
     fdr_factor: 2
     chunk_points: 500                  # grid points per parallel job (memory)
+    versus_m1: true                    # also test whether each method beats M1 (paired block bootstrap, significance_m1.nc)
+  m0_spread: own_errors                # M0 spread: RMS of its own errors (= the internal window means), non-overlapping samples, as M1/M0c/M0t
+  obs_methods:                         # reference methods from the observed target alone (no CMIP6), full target only:
+    enabled: true                      # M0c (return to the observed mean) and M0t (observed linear trend)
+    fit: up_to_init                    # up_to_init: a real forecast | leave_out: all years except target window and reference (as M0)
+    min_years: 20                      # fewer fitting years: no prediction
+
+#---------------variance partition (`pixi run partition`, any time after the split)--------------#
+# Spread of the CMIP6 projections of the change of an N-year window mean against the reference period
+# (target.reference_length years up to init): internal variability, model and scenario uncertainty
+# (Hawkins & Sutton 2009), per lead time, over all scenarios of cmip6.scenarios (src/climate_scenarios_2050/partition.py)
+partition:
+  init: 2025                           # last year of the reference period
+  window_lengths: [5, 10, 20]          # N
+  max_lead: null                       # first window year after init; null: as far as the projections go
+  indices: null                        # null: all indices of the configuration
+  targets: null                        # null: the active targets with a CMIP6 field (energy has none)
+  regions:                             # boxes of the targets' area means
+    scandinavia: {lon: [4, 32], lat: [55, 72]}   # Norway and Sweden
 
 #---------------step 7: yearly update of the index--------------#
 update:

@@ -11,6 +11,10 @@ grid point) is estimated by least squares on a set of regressors ("basis"):
 - method `lowpass_mmem`: one regressor, the low-pass filtered MMEM
 - method `polynomial`: powers of time (a trend of arbitrary shape)
 
+Observed targets use the predictor's basis (`targets.<name>.forced: index`, e.g. the NAO MMEM for wind)
+or, per grid point, the MMEM of their own CMIP6 variable (`forced: cmip6`, e.g. tas): the design matrix
+then has space dims (year, term, lat, lon) and every point is fitted on its own regressor.
+
 The MMEM itself contains no observations; leakage only enters through the coefficients fitted to
 observations. They are therefore fitted separately per "case", each with its own set of excluded
 years (see the `*_exclusions` functions). A case only stores coefficients, the internal part of
@@ -72,6 +76,25 @@ def design_matrix(basis: xr.DataArray, years, lag: int = 0) -> xr.DataArray:
     return xr.concat([intercept, shifted], dim="term").transpose("year", "term")
 
 
+def pointwise_design(field: xr.DataArray, years) -> xr.DataArray:
+    """
+    design (year, term, space...) with a regressor per grid point: intercept + `field` (year, space...).
+    The regressor is centred on its mean over all years of `field` (e.g. tas ~285 K varying by ~1 K: the
+    normal equations would be badly conditioned), which only changes the meaning of the intercept.
+    """
+    field = field.astype("float64")
+    shifted = (field - field.mean("year")).reindex(year=np.asarray(years))
+    terms = xr.DataArray(["intercept", "mmem_cmip6"], dims="term", name="term")
+    return xr.concat([xr.ones_like(shifted), shifted], dim=terms).transpose("year", "term", ...)
+
+
+def forced_values(design: np.ndarray, coef: np.ndarray) -> np.ndarray:
+    """forced part (year, points) of design (year, term) or (year, term, points) and coef (term, points)"""
+    if design.ndim == 2:
+        return design @ coef
+    return np.einsum("ytp,tp->yp", design, coef)
+
+
 #---------------exclusions (True = year not used for fitting)--------------#
 def full_period_exclusions(years) -> xr.DataArray:
     return xr.DataArray(np.zeros(len(years), dtype=bool), dims="year", coords={"year": np.asarray(years)})
@@ -112,6 +135,8 @@ def fit_coefficients(series: xr.DataArray, design: xr.DataArray, excluded: xr.Da
     dims (year, ...); grid points with missing values in the used years get NaN.
     Returns dims: case dims + (term, ...).
     """
+    if design.ndim > 2:
+        return _fit_pointwise(series, design, excluded, min_fit_years)
     series = series.transpose("year", ...)
     space_dims = list(series.dims[1:])
     design = design.sel(year=series.year)
@@ -145,6 +170,42 @@ def fit_coefficients(series: xr.DataArray, design: xr.DataArray, excluded: xr.Da
     coords["term"] = design["term"]
     coords.update({d: series[d] for d in space_dims})
     return xr.DataArray(coef.reshape(*case_shape, X.shape[1], *space_shape), dims=(*case_dims, "term", *space_dims), coords=coords, name="coef")
+
+
+def _fit_pointwise(series: xr.DataArray, design: xr.DataArray, excluded: xr.DataArray, min_fit_years: int) -> xr.DataArray:
+    """`fit_coefficients` for a design with space dims: least squares per point on the point's own years"""
+    series = series.transpose("year", ...)
+    space_dims = list(series.dims[1:])
+    design = design.sel(year=series.year).transpose("year", "term", *space_dims)
+    excluded = excluded.sel(year=series.year)
+    case_dims = [d for d in excluded.dims if d != "year"]
+    excl = excluded.transpose(*case_dims, "year").values if case_dims else excluded.values[None, :]
+
+    n_years, n_terms = series.sizes["year"], design.sizes["term"]
+    Y = series.values.reshape(n_years, -1).astype("float64")
+    X = design.values.reshape(n_years, n_terms, -1).astype("float64")
+    valid = np.isfinite(Y) & np.isfinite(X).all(axis=1)          # (year, point)
+    Y0 = np.where(valid, Y, 0.0)
+    X0 = np.where(valid[:, None], X, 0.0)
+
+    n_cases = int(np.prod(excl.shape[:-1]))
+    coef = np.full((n_cases, n_terms, Y.shape[1]), np.nan, dtype="float64")
+    for ic, row in enumerate(excl.reshape(n_cases, -1)):
+        use = valid & ~row[:, None]
+        ok = use.sum(axis=0) >= min_fit_years
+        if not ok.any():
+            continue
+        Xu = X0[:, :, ok] * use[:, None, ok]
+        gram = np.einsum("ytp,ysp->pts", Xu, X0[:, :, ok])
+        rhs = np.einsum("ytp,yp->pt", Xu, Y0[:, ok])
+        coef[ic][:, ok] = np.einsum("pts,ps->tp", np.linalg.pinv(gram), rhs)
+
+    case_shape = [excluded.sizes[d] for d in case_dims]
+    space_shape = [series.sizes[d] for d in space_dims]
+    coords = {d: excluded[d] for d in case_dims}
+    coords["term"] = design["term"]
+    coords.update({d: series[d] for d in space_dims})
+    return xr.DataArray(coef.reshape(*case_shape, n_terms, *space_shape), dims=(*case_dims, "term", *space_dims), coords=coords, name="coef")
 
 
 def forced_part(design: xr.DataArray, coef: xr.DataArray) -> xr.DataArray:
